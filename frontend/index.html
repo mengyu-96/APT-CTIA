@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>APT归因分析系统（）</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <div class="logo">
+                <i class="fas fa-shield-alt"></i>
+                <div>
+                    <span style="font-size: 1.5rem; font-weight: 700; color: #667eea;"></span>
+                    <div style="font-size: 0.8rem; color: #aaa; margin-top: 0.25rem;">APT归因分析系统</div>
+                </div>
+            </div>
+            <ul class="nav-menu">
+                <li class="nav-item active" data-page="home">
+                    <i class="fas fa-home"></i>
+                    <span>主页</span>
+                </li>
+                <li class="nav-item" data-page="upload">
+                    <i class="fas fa-cloud-upload-alt"></i>
+                    <span>样本上传与预处理</span>
+                </li>
+                <li class="nav-item" data-page="features">
+                    <i class="fas fa-chart-bar"></i>
+                    <span>特征提取与可视化</span>
+                </li>
+                <li class="nav-item" data-page="clustering">
+                    <i class="fas fa-project-diagram"></i>
+                    <span>模型训练</span>
+                </li>
+                <li class="nav-item" data-page="attribution">
+                    <i class="fas fa-project-diagram"></i>
+                    <span>APT归因结果</span>
+                </li>
+                <li class="nav-item" data-page="case-studies">
+                    <i class="fas fa-users"></i>
+                    <span>团伙库</span>
+                </li>
+                <li class="nav-item" data-page="dataset">
+                    <i class="fas fa-database"></i>
+                    <span>数据集管理</span>
+                </li>
+                <li class="nav-item" data-page="report">
+                    <i class="fas fa-file-alt"></i>
+                    <span>报告生成与导出</span>
+                </li>
+                <li class="nav-item" data-page="models">
+                    <i class="fas fa-brain"></i>
+                    <span>模型管理</span>
+                </li>
+            </ul>
+        </nav>
+
+        <main class="main-content">
+            <div class="page active" id="page-home">
+                <div class="home-section" style="background-image: url('images/background.jpg'); background-size: cover; background-position: center; background-repeat: no-repeat;">
+                    <div class="welcome-content">
+                        <h1>欢迎使用RGAPT</h1>
+                        <h2>APT归因分析系统</h2>
+                        <p>
+                            是一个专业的APT归因分析系统，致力于帮助安全专家快速、准确地识别和分析高级持续性威胁。
+                            系统集成了先进的特征提取、模型训练和APT归因结果技术，为您的网络安全保驾护航。
+                        </p>
+                    </div>
+                    <div class="feature-modules">
+                            <div class="feature-module">
+                                <i class="fas fa-cloud-upload-alt"></i>
+                                <p>样本上传与预处理</p>
+                            </div>
+                            <div class="feature-module">
+                                <i class="fas fa-brain"></i>
+                                <p>模型管理</p>
+                            </div>
+                            <div class="feature-module">
+                                <i class="fas fa-chart-bar"></i>
+                                <p>特征提取与可视化</p>
+                            </div>
+                            <div class="feature-module">
+                                <i class="fas fa-bullseye"></i>
+                                <p>模型训练</p>
+                            </div>
+                            <div class="feature-module">
+                                <i class="fas fa-project-diagram"></i>
+                                <p>APT归因结果</p>
+                            </div>
+                            <div class="feature-module">
+                                <i class="fas fa-users"></i>
+                                <p>团伙库</p>
+                            </div>
+                            <div class="feature-module">
+                                <i class="fas fa-database"></i>
+                                <p>数据集管理</p>
+                            </div>
+                            <div class="feature-module">
+                                <i class="fas fa-file-alt"></i>
+                                <p>报告生成与导出</p>
+                            </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-upload">
+                <div class="page-header">
+                    <h2><i class="fas fa-cloud-upload-alt"></i> 样本上传与预处理</h2>
+                </div>
+                <div class="page-content">
+                    <div class="upload-section">
+                        <div class="upload-area" id="uploadArea">
+                            <i class="fas fa-upload"></i>
+                            <p>拖拽样本文件到此处或点击上传</p>
+                            <input type="file" id="fileInput" multiple>
+                        </div>
+                        <div class="file-list" id="fileList">
+                            <div class="empty-state">
+                                <i class="fas fa-inbox"></i>
+                                <p>暂无上传文件</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-features">
+                <div class="page-header">
+                    <h2><i class="fas fa-chart-bar"></i> 特征提取与可视化</h2>
+                </div>
+                <div class="page-content">
+                    <div class="extraction-controls">
+                        <div class="control-group">
+                            <label>选择样本</label>
+                            <select id="sampleSelect">
+                                <option value="">请选择样本...</option>
+                                <option value="sample1">APT样本_001.exe</option>
+                                <option value="sample2">恶意软件_002.dll</option>
+                                <option value="sample3">网络流量_003.pcap</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-primary" id="extractAllFeatures">提取所有特征</button>
+                    </div>
+                    <div class="feature-tabs">
+                        <button class="feature-tab active" data-tab="all">所有特征</button>
+                        <button class="feature-tab" data-tab="static">静态特征</button>
+                        <button class="feature-tab" data-tab="dynamic">动态特征</button>
+                        <button class="feature-tab" data-tab="network">网络特征</button>
+                    </div>
+                    <div class="feature-content" id="featureDetailContent">
+                        <div class="feature-panel active" id="all-features">
+                            <div class="chart-container">
+                                <h4>所有特征分布</h4>
+                                <canvas id="overallPieChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="feature-panel" id="static-features">
+                            <div class="chart-container">
+                                <h4>静态特征统计</h4>
+                                <canvas id="staticBarChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="feature-panel" id="dynamic-features">
+                            <div class="chart-container">
+                                <h4>动态特征统计</h4>
+                                <canvas id="dynamicBarChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="feature-panel" id="network-features">
+                            <div class="chart-container">
+                                <h4>网络特征统计</h4>
+                                <canvas id="networkBarChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-clustering">
+                <div class="page-header">
+                    <h2><i class="fas fa-project-diagram"></i> 模型训练</h2>        
+                </div>
+                <div class="page-content">
+                    <div class="clustering-section">
+                        <div class="clustering-controls">
+                            <div class="control-group">
+                                <label>选择数据集</label>
+                                <select id="clusteringDatasetSelect">
+                                    <option value="">请选择数据集...</option>
+                                    <option value="dataset1">APT样本集 v1.0</option>
+                                    <option value="dataset2">恶意软件样本集 v2.0</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label>聚类算法</label>
+                                <select id="clusteringAlgorithm">
+                                    <option value="kmeans">K-Means</option>
+                                    <option value="dbscan">DBSCAN</option>
+                                    <option value="hierarchical">层次聚类</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label>聚类数量</label>
+                                <input type="number" id="clusterCount" value="5" min="2" max="20">
+                            </div>
+                            <button class="btn btn-primary" id="runClustering">运行模型训练</button>
+                        </div>
+                        <div class="clustering-results">
+                            <div class="clustering-visualization">
+                                <div class="visualization-header">
+                                    <h3>降维散点图</h3>
+                                    <div class="visualization-controls">
+                                        <button class="btn btn-sm" id="resetZoom">重置视图</button>
+                                        <button class="btn btn-sm" id="clearSelection">清除选择</button>
+                                    </div>
+                                </div>
+                                <div class="scatter-plot-container">
+                                    <canvas id="scatterPlot"></canvas>
+                                </div>
+                            </div>
+                            <div class="clustering-summary">
+                                <h3>聚类摘要</h3>
+                                <div class="cluster-cards" id="clusterCards">
+                                    <div class="empty-state">
+                                        <i class="fas fa-project-diagram"></i>
+                                        <p>请先运行模型训练</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="cluster-details">
+                                <h3>簇详情</h3>
+                                <div class="detail-content" id="clusterDetailContent">
+                                    <div class="empty-state" id="noSelectionMessage">
+                                        <i class="fas fa-info-circle"></i>
+                                        <p>选择一个模型训练查看详情</p>
+                                    </div>
+                                    <div id="selectedClusterDetails" style="display: none;">
+                                        <div style="margin-bottom: 1rem;">
+                                            <span style="color: #aaa;">簇ID：</span>
+                                            <span id="detailClusterId" style="color: #ffffff; font-weight: 600;"></span>
+                                        </div>
+                                        <div style="margin-bottom: 1rem;">
+                                            <span style="color: #aaa;">样本数量：</span>
+                                            <span id="detailSampleCount" style="color: #ffffff; font-weight: 600;"></span>
+                                        </div>
+                                        <div style="margin-bottom: 1rem;">
+                                            <span style="color: #aaa;">置信度：</span>
+                                            <span id="detailConfidence" style="color: #ffffff; font-weight: 600;"></span>
+                                        </div>
+                                        <div style="margin-bottom: 1rem;">
+                                            <span style="color: #aaa;">首次发现：</span>
+                                            <span id="detailFirstSeen" style="color: #ffffff; font-weight: 600;"></span>
+                                        </div>
+                                        <div style="margin-bottom: 1rem;">
+                                            <span style="color: #aaa;">C2域名：</span>
+                                            <span id="detailC2Domains" style="color: #ffffff; font-weight: 600;"></span>
+                                        </div>
+                                        <div style="margin-bottom: 1rem;">
+                                            <span style="color: #aaa;">MD5：</span>
+                                            <span id="detailMD5" style="color: #ffffff; font-weight: 600;"></span>
+                                        </div>
+                                        <div style="margin-bottom: 1rem;">
+                                            <span style="color: #aaa;">相关报告：</span>
+                                            <span id="detailReports" style="color: #ffffff; font-weight: 600;"></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-attribution">
+                <div class="page-header">
+                    <h2><i class="fas fa-project-diagram"></i> APT归因结果</h2>
+                </div>
+                <div class="page-content">
+                    <div class="attribution-section">
+                        <div style="margin-bottom: 1.5rem;">
+                            <label style="font-weight: 600; color: #ffffff; display: block; margin-bottom: 0.5rem; font-size: 0.9rem;">选择模型训练结果</label>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <select id="attributionClusterSelect" style="flex: 1; padding: 0.6rem; border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 6px; font-size: 0.9rem; background: rgba(0, 23, 46, 0.9); color: #ffffff;">
+                                    <option value="">请先运行模型训练...</option>
+                                </select>
+                                <button class="btn btn-primary" id="analyzeAttribution" style="padding: 0.6rem 1rem; font-size: 0.9rem;">分析归因</button>
+                            </div>
+                        </div>
+                        
+                        <div id="attributionContent">
+                            <div style="text-align: center; padding: 3rem; color: #aaa;">
+                                <i class="fas fa-chart-network" style="font-size: 3rem; margin-bottom: 1rem;"></i>
+                                <p style="font-size: 1rem;">请选择模型训练结果进行归因分析</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-case-studies">
+                <div class="page-header">
+                    <h2><i class="fas fa-users"></i> 团伙库</h2>
+                </div>
+                <div class="page-content">
+                    <div class="gang-storage-section">
+                        <div class="gang-filters" style="margin-bottom: 1.5rem;">
+                            <select id="gangFilter" style="width: 200px; padding: 0.6rem; border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 6px; font-size: 0.9rem; background: rgba(0, 23, 46, 0.9); color: #ffffff; cursor: pointer;">
+                                <option value="all">所有团伙</option>
+                                <option value="known">已知组织</option>
+                                <option value="custom">自定义组织</option>
+                            </select>
+                        </div>
+                        <div class="gang-list" id="gangList">
+                            <div style="text-align: center; padding: 3rem; color: #aaa;">
+                                <i class="fas fa-users" style="font-size: 3rem; margin-bottom: 1rem;"></i>
+                                <p>暂无团伙数据，请先运行模型训练</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-dataset">
+                <div class="page-header">
+                    <h2><i class="fas fa-database"></i> 数据集管理</h2>
+                </div>
+                <div class="page-content">
+                    <div class="dataset-section">
+                        <div class="dataset-stats">
+                            <div class="stat-card">
+                                <i class="fas fa-file"></i>
+                                <h3>样本总数</h3>
+                                <p class="stat-value" id="totalSamples">1,234</p>
+                            </div>
+                            <div class="stat-card">
+                                <i class="fas fa-virus"></i>
+                                <h3>恶意样本</h3>
+                                <p class="stat-value" id="maliciousSamples">856</p>
+                            </div>
+                            <div class="stat-card">
+                                <i class="fas fa-check-circle"></i>
+                                <h3>良性样本</h3>
+                                <p class="stat-value" id="benignSamples">378</p>
+                            </div>
+                            <div class="stat-card">
+                                <i class="fas fa-users"></i>
+                                <h3>APT组织</h3>
+                                <p class="stat-value" id="aptGroups">42</p>
+                            </div>
+                        </div>
+                        <div class="dataset-table">
+                            <h3>数据集列表</h3>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>数据集名称</th>
+                                        <th>样本数量</th>
+                                        <th>类型</th>
+                                        <th>更新时间</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>APT样本集 v1.0</td>
+                                        <td>500</td>
+                                        <td>APT</td>
+                                        <td>2024-01-15</td>
+                                        <td>
+                                            <button class="btn btn-sm">查看</button>
+                                            <button class="btn btn-sm">下载</button>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>恶意软件样本集 v2.0</td>
+                                        <td>734</td>
+                                        <td>恶意软件</td>
+                                        <td>2024-01-10</td>
+                                        <td>
+                                            <button class="btn btn-sm">查看</button>
+                                            <button class="btn btn-sm">下载</button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-report">
+                <div class="page-header">
+                    <h2><i class="fas fa-file-alt"></i> 报告生成与导出</h2>
+                </div>
+                <div class="page-content">
+                    <div class="report-section">
+                        <div class="report-options">
+                            <div class="option-group">
+                                <label>报告类型</label>
+                                <select id="reportType">
+                                    <option value="summary">摘要报告</option>
+                                    <option value="detailed">详细报告</option>
+                                    <option value="technical">技术报告</option>
+                                </select>
+                            </div>
+                            <div class="option-group">
+                                <label>导出格式</label>
+                                <select id="reportFormat">
+                                    <option value="pdf">PDF</option>
+                                    <option value="json">JSON</option>
+                                    <option value="stix">STIX 2.0</option>
+                                </select>
+                            </div>
+                            <button class="btn btn-primary" id="generateReport">生成报告</button>
+                        </div>
+                        <div class="report-preview">
+                            <h3>报告预览</h3>
+                            <div class="preview-content">
+                                <div class="empty-state">
+                                    <i class="fas fa-file-alt"></i>
+                                    <p>选择报告类型和格式后生成报告</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-models">
+                <div class="page-header">
+                    <h2><i class="fas fa-brain"></i> 模型管理</h2>
+                </div>
+                <div class="page-content">
+                    <div class="models-section">
+                        <div class="model-upload">
+                            <h3>上传模型</h3>
+                            <div class="upload-area" id="modelUploadArea">
+                                <i class="fas fa-upload"></i>
+                                <p>拖拽模型文件到此处或点击上传</p>
+                                <input type="file" id="modelInput" accept=".pkl,.h5,.pt,.pth,.onnx,.pb">
+                            </div>
+                            <div class="model-info">
+                                <div class="info-group">
+                                    <label>模型名称</label>
+                                    <input type="text" id="modelName" placeholder="输入模型名称">
+                                </div>
+                                <div class="info-group">
+                                    <label>模型类型</label>
+                                    <select id="modelType">
+                                        <option value="classification">分类模型</option>
+                                        <option value="training">训练模型</option>
+                                        <option value="detection">检测模型</option>
+                                    </select>
+                                </div>
+                                <div class="info-group full-width">
+                                    <label>描述</label>
+                                    <textarea id="modelDescription" placeholder="输入模型描述"></textarea>
+                                </div>
+                            </div>
+                            <button class="btn btn-primary" id="uploadModel">上传模型</button>
+                        </div>
+                        <div class="model-list">
+                            <h3>已上传模型</h3>
+                            <div class="models-grid" id="modelsGrid">
+                                <div class="model-card">
+                                    <div class="model-icon">
+                                        <i class="fas fa-brain"></i>
+                                    </div>
+                                    <h4>恶意软件分类模型 v1.0</h4>
+                                    <p class="model-type">分类模型</p>
+                                    <p class="model-desc">基于深度学习的恶意软件分类模型</p>
+                                    <div class="model-actions">
+                                        <button class="btn btn-sm btn-select">选择</button>
+                                        <button class="btn btn-sm btn-delete">删除</button>
+                                    </div>
+                                </div>
+                                <div class="model-card">
+                                    <div class="model-icon">
+                                        <i class="fas fa-project-diagram"></i>
+                                    </div>
+                                    <h4>APT聚类模型 v2.0</h4>
+                                    <p class="model-type">训练模型</p>
+                                    <p class="model-desc">基于特征相似度的APT组织聚类模型</p>
+                                    <div class="model-actions">
+                                        <button class="btn btn-sm btn-select">选择</button>
+                                        <button class="btn btn-sm btn-delete">删除</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div id="hoverTooltip" style="position: absolute; background: rgba(0, 23, 46, 0.95); border: 1px solid rgba(0, 212, 255, 0.5); border-radius: 8px; padding: 1rem; pointer-events: none; z-index: 1000; display: none; min-width: 200px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);"></div>
+    <div id="selectionBox" style="position: absolute; border: 2px dashed #00d4ff; background: rgba(0, 212, 255, 0.1); pointer-events: none; z-index: 999; display: none;"></div>
+
+    <script src="js/app.js?v=3"></script>
+</body>
+</html>

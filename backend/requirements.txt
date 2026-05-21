@@ -1,0 +1,16 @@
+flask
+pandas
+tqdm
+scikit-learn
+torch
+torch-geometric
+requests
+matplotlib
+seaborn
+reportlab
+networkx
+pdfplumber
+pymupdf
+chardet
+langdetect
+sentence-transformers

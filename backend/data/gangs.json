@@ -1,0 +1,57 @@
+[
+    {
+        "id": "APT28",
+        "aliases": "Fancy Bear, Pawn Storm, Sofacy",
+        "origin": "Russia",
+        "targets": "Government, Military, Security organizations",
+        "description": "APT28 is a threat group that has been attributed to Russia's General Staff Main Intelligence Directorate (GRU). They are known for cyber espionage campaigns.",
+        "last_seen": "2023-10",
+        "tools": "XAgent, XTunnel, Zebrocy",
+        "iocs": ["89.45.67.12", "update-microsoft.com", "xagent.exe"],
+        "related_samples": ["sample_001.exe (98%)", "malware_test.dll (92%)"]
+    },
+    {
+        "id": "Lazarus Group",
+        "aliases": "Hidden Cobra, Guardians of Peace",
+        "origin": "North Korea",
+        "targets": "Financial institutions, Cryptocurrency exchanges",
+        "description": "Lazarus Group is a state-sponsored cyber threat group attributed to the North Korean government. They are motivated by financial gain and espionage.",
+        "last_seen": "2023-09",
+        "tools": "Manuscrypt, Bankshot, Fallchill",
+        "iocs": ["104.23.11.90", "crypto-market-update.net", "manuscrypt.dll"],
+        "related_samples": ["finance_report.pdf.exe (99%)"]
+    },
+    {
+        "id": "APT29",
+        "aliases": "Cozy Bear, The Dukes",
+        "origin": "Russia",
+        "targets": "Government, Diplomatic, Think Tanks",
+        "description": "APT29 is a threat group attributed to Russia's Foreign Intelligence Service (SVR). They focus on gathering intelligence to inform foreign policy decisions.",
+        "last_seen": "2023-11",
+        "tools": "MiniDuke, CosmicDuke, SeaDuke",
+        "iocs": ["185.20.14.22", "adobe-updater.com", "cosmic.dat"],
+        "related_samples": ["embassy_memo.docx (95%)"]
+    },
+    {
+        "id": "Equation Group",
+        "aliases": "N/A",
+        "origin": "USA (suspected)",
+        "targets": "Government, Military, Telecom, Energy",
+        "description": "Equation Group is a highly sophisticated threat actor suspected of being tied to the NSA. They use advanced malware and zero-day exploits.",
+        "last_seen": "2022-05",
+        "tools": "Fanny, EquationDrug, DoubleFantasy",
+        "iocs": ["fanny.bmp", "nls_933w.dll"],
+        "related_samples": []
+    },
+    {
+        "id": "APT41",
+        "aliases": "Double Dragon, Barium",
+        "origin": "China",
+        "targets": "Healthcare, Telecom, Technology",
+        "description": "APT41 is a state-sponsored espionage group that also conducts financially motivated operations. They are known for supply chain attacks.",
+        "last_seen": "2023-08",
+        "tools": "Cobalt Strike, Derusbi, PlugX",
+        "iocs": ["update-google.com", "shadowpad.exe"],
+        "related_samples": ["supply_chain_installer.exe (90%)"]
+    }
+]

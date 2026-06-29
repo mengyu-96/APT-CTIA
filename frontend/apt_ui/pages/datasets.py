@@ -1,12 +1,46 @@
-
+import requests
 import streamlit as st
 import pandas as pd
-import requests
-import time
-import os
-from apt_ui.services.api_client import clear_api_cache, get_json
+from apt_ui.services.api_client import build_upload_payload, invalidate, get_json, request
+from apt_ui.services import ui
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5001")
+MAX_RAW_FILE_ROWS = 2000
+MAX_GRAPH_SAMPLE_ROWS = 5000
+PAGE_SIZE = 50
+
+
+def _paginated(df: pd.DataFrame, key: str, *, search_cols: list[str] | None = None):
+    """Search + paginate a DataFrame; returns the visible slice.
+
+    Keeps big tables responsive by only handing st.data_editor one page at a
+    time instead of rendering thousands of rows at once.
+    """
+    if df.empty:
+        return df
+
+    if search_cols:
+        query = st.text_input("搜索", key=f"{key}_search", placeholder="输入关键字过滤…",
+                              label_visibility="collapsed")
+        if query:
+            ql = query.lower()
+            mask = pd.Series(False, index=df.index)
+            for col in search_cols:
+                if col in df.columns:
+                    mask |= df[col].astype(str).str.lower().str.contains(ql, na=False)
+            df = df[mask]
+
+    total = len(df)
+    if total <= PAGE_SIZE:
+        return df
+
+    pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    page = st.number_input(
+        f"页码（共 {pages} 页 / {total} 行）",
+        min_value=1, max_value=pages, value=1, step=1, key=f"{key}_page",
+    )
+    start = (page - 1) * PAGE_SIZE
+    return df.iloc[start:start + PAGE_SIZE]
+
 
 def get_datasets():
     return get_json("/api/datasets", timeout=5, default=[])
@@ -17,9 +51,17 @@ def get_raw_datasets():
 def get_raw_files(path):
     return get_json("/api/raw_datasets/files", params={"path": path}, timeout=5, default={})
 
+def get_dataset_graphs(dataset_id):
+    return get_json(f"/api/datasets/{dataset_id}/graphs", timeout=5, default=[], ttl="slow")
+
+def _get_state_list(key, loader):
+    if key not in st.session_state:
+        st.session_state[key] = loader()
+    return st.session_state[key]
+
 def rename_dataset(dataset_id, new_name):
     try:
-        response = requests.put(f"{BACKEND_URL}/api/datasets/{dataset_id}/rename", json={"new_name": new_name}, timeout=5)
+        response = request("PUT", f"/api/datasets/{dataset_id}/rename", json_body={"new_name": new_name}, timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -29,7 +71,7 @@ def rename_dataset(dataset_id, new_name):
 
 def delete_dataset(dataset_id):
     try:
-        response = requests.delete(f"{BACKEND_URL}/api/datasets/{dataset_id}", timeout=5)
+        response = request("DELETE", f"/api/datasets/{dataset_id}", timeout=5)
         if response.status_code == 200:
             return True, "删除成功"
         else:
@@ -39,7 +81,7 @@ def delete_dataset(dataset_id):
 
 def delete_graph(dataset_id, report_id):
     try:
-        response = requests.delete(f"{BACKEND_URL}/api/datasets/{dataset_id}/graphs/{report_id}", timeout=5)
+        response = request("DELETE", f"/api/datasets/{dataset_id}/graphs/{report_id}", timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -55,7 +97,7 @@ def split_dataset(dataset_id, train_ratio, val_ratio):
             "val_ratio": val_ratio,
             "test_ratio": test_ratio
         }
-        response = requests.post(f"{BACKEND_URL}/api/datasets/{dataset_id}/split", json=payload, timeout=5)
+        response = request("POST", f"/api/datasets/{dataset_id}/split", json_body=payload, timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -66,17 +108,19 @@ def split_dataset(dataset_id, train_ratio, val_ratio):
 def start_preprocessing(raw_path):
     try:
         payload = {"raw_dataset_path": raw_path}
-        response = requests.post(f"{BACKEND_URL}/api/preprocess", json=payload, timeout=5)
+        response = request("POST", "/api/preprocess", json_body=payload, timeout=(5, 60))
         if response.status_code == 202:
             return True, response.json()
         else:
             return False, response.json().get('error', 'Unknown error')
+    except requests.exceptions.ReadTimeout:
+        return False, "后端提交超时，但预处理任务可能已经进入队列。请刷新任务列表确认。"
     except Exception as e:
         return False, str(e)
 
 def create_raw_dataset(name):
     try:
-        response = requests.post(f"{BACKEND_URL}/api/raw_datasets", json={"name": name}, timeout=5)
+        response = request("POST", "/api/raw_datasets", json_body={"name": name}, timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -86,7 +130,7 @@ def create_raw_dataset(name):
 
 def delete_raw_dataset(name):
     try:
-        response = requests.delete(f"{BACKEND_URL}/api/raw_datasets/{name}", timeout=5)
+        response = request("DELETE", f"/api/raw_datasets/{name}", timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -96,7 +140,7 @@ def delete_raw_dataset(name):
 
 def rename_raw_dataset(name, new_name):
     try:
-        response = requests.put(f"{BACKEND_URL}/api/raw_datasets/{name}", json={"new_name": new_name}, timeout=5)
+        response = request("PUT", f"/api/raw_datasets/{name}", json_body={"new_name": new_name}, timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -106,7 +150,7 @@ def rename_raw_dataset(name, new_name):
 
 def copy_raw_dataset(name, new_name):
     try:
-        response = requests.post(f"{BACKEND_URL}/api/raw_datasets/{name}/copy", json={"new_name": new_name}, timeout=10)
+        response = request("POST", f"/api/raw_datasets/{name}/copy", json_body={"new_name": new_name}, timeout=10)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -116,7 +160,7 @@ def copy_raw_dataset(name, new_name):
 
 def delete_raw_file(dataset_name, filename):
     try:
-        response = requests.delete(f"{BACKEND_URL}/api/raw_datasets/{dataset_name}/files/{filename}", timeout=5)
+        response = request("DELETE", f"/api/raw_datasets/{dataset_name}/files/{filename}", timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -126,7 +170,7 @@ def delete_raw_file(dataset_name, filename):
 
 def copy_raw_file(dataset_name, filename, target_dataset):
     try:
-        response = requests.post(f"{BACKEND_URL}/api/raw_datasets/{dataset_name}/files/{filename}/copy", json={"target_dataset": target_dataset}, timeout=5)
+        response = request("POST", f"/api/raw_datasets/{dataset_name}/files/{filename}/copy", json_body={"target_dataset": target_dataset}, timeout=5)
         if response.status_code == 200:
             return True, response.json()
         else:
@@ -136,10 +180,10 @@ def copy_raw_file(dataset_name, filename, target_dataset):
 
 def upload_raw_files(dataset_name, files):
     try:
-        files_payload = [('files', (f.name, f.getvalue(), f.type)) for f in files]
-        response = requests.post(
-            f"{BACKEND_URL}/api/raw_datasets/{dataset_name}/upload",
-            files=files_payload,
+        response = request(
+            "POST",
+            f"/api/raw_datasets/{dataset_name}/upload",
+            files=build_upload_payload("files", files),
             timeout=120
         )
         try:
@@ -249,12 +293,12 @@ def render_raw_file_explorer():
     
     with col_t1:
         if not is_root:
-            if st.button("⬆️ 上一级", use_container_width=True):
+            if st.button("⬆️ 上一级", width="stretch"):
                 st.session_state['explorer_path'].pop()
                 st.rerun()
         else:
-            if st.button("🔄 刷新", use_container_width=True):
-                clear_api_cache()
+            if st.button("🔄 刷新", width="stretch"):
+                invalidate("datasets", "raw_datasets")
                 st.session_state['raw_datasets'] = get_raw_datasets()
                 st.rerun()
 
@@ -267,13 +311,11 @@ def render_raw_file_explorer():
 
 def _render_root_view(c_new, c_paste, c_del, c_rename):
     # Fetch Data
-    if 'raw_datasets' not in st.session_state:
-        st.session_state['raw_datasets'] = get_raw_datasets()
-    datasets = st.session_state['raw_datasets']
+    datasets = _get_state_list('raw_datasets', get_raw_datasets)
     
     # Toolbar Actions (Root)
     with c_new:
-        if st.button("➕ 新建", use_container_width=True):
+        if st.button("➕ 新建", width="stretch"):
             st.session_state['show_create_modal'] = True
     
     if st.session_state.get('show_create_modal'):
@@ -283,7 +325,7 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
                     if new_name:
                         ok, res = create_raw_dataset(new_name)
                         if ok:
-                            clear_api_cache()
+                            invalidate("datasets", "raw_datasets")
                             st.success(f"创建成功: {new_name}")
                             st.session_state['raw_datasets'] = get_raw_datasets()
                         st.session_state['show_create_modal'] = False
@@ -315,7 +357,7 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
         },
         hide_index=True,
         key="root_editor",
-        use_container_width=True
+        width="stretch"
     )
     
     # Handle Selection
@@ -324,7 +366,7 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
     # Rename Action
     with c_rename:
         if len(selected_rows) == 1:
-            if st.button("✏️ 重命名", use_container_width=True, key="rename_raw_btn"):
+            if st.button("✏️ 重命名", width="stretch", key="rename_raw_btn"):
                 st.session_state['renaming_raw_ds'] = selected_rows.iloc[0]['Name']
     
     # Rename Form
@@ -342,11 +384,10 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
                     if new_name_input and new_name_input != target_ds:
                         ok, res = rename_raw_dataset(target_ds, new_name_input)
                         if ok:
-                            clear_api_cache()
+                            invalidate("datasets", "raw_datasets")
                             st.success("重命名成功")
                             st.session_state['raw_datasets'] = get_raw_datasets()
                             del st.session_state['renaming_raw_ds']
-                            time.sleep(0.5)
                             st.rerun()
                         else:
                             st.error(f"失败: {res}")
@@ -360,16 +401,15 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
     # Batch Delete
     with c_del:
         if not selected_rows.empty:
-            if st.button("🗑️ 删除", type="primary", use_container_width=True):
+            if st.button("🗑️ 删除", type="primary", width="stretch"):
                 success_count = 0
                 for _, row in selected_rows.iterrows():
                     ok, _ = delete_raw_dataset(row['Name'])
                     if ok: success_count += 1
                 if success_count > 0:
-                    clear_api_cache()
+                    invalidate("datasets", "raw_datasets")
                     st.toast(f"已删除 {success_count} 个数据集")
                     st.session_state['raw_datasets'] = get_raw_datasets()
-                    time.sleep(1)
                     st.rerun()
     
     # Navigation (Click to enter)
@@ -389,7 +429,7 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
 
 def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
     # Get current dataset info
-    raw_datasets = st.session_state.get('raw_datasets', get_raw_datasets())
+    raw_datasets = _get_state_list('raw_datasets', get_raw_datasets)
     current_ds = next((d for d in raw_datasets if d['name'] == ds_name), None)
     
     if not current_ds:
@@ -401,10 +441,11 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
     # Fetch files
     files_data = get_raw_files(current_ds['path'])
     files = files_data.get('files', [])
+    visible_files = files[:MAX_RAW_FILE_ROWS]
     
     # Import Action
     with c_import:
-        if st.button("📤 导入", use_container_width=True, help="上传文件到当前数据集"):
+        if st.button("📤 导入", width="stretch", help="上传文件到当前数据集"):
              st.session_state[f'show_upload_{ds_name}'] = not st.session_state.get(f'show_upload_{ds_name}', False)
 
     # Preprocessing Action (Moved to main area or keep in toolbar? Toolbar is full. Let's put pre-process button above table)
@@ -420,14 +461,13 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
                      with st.spinner("正在上传并处理..."):
                          ok, res = upload_raw_files(ds_name, uploaded)
                          if ok:
-                             clear_api_cache()
+                             invalidate("datasets", "raw_datasets")
                              st.success(f"上传成功: {res['message']}")
                              if res.get('errors'):
                                  with st.expander("部分文件出错"):
                                      for err in res['errors']:
                                          st.warning(err)
                              st.session_state[f'show_upload_{ds_name}'] = False
-                             time.sleep(1)
                              st.rerun()
                          else:
                              st.error(f"上传失败: {res}")
@@ -435,22 +475,24 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
 
     col_pre, _ = st.columns([1, 4])
     with col_pre:
-        if st.button("⚙️ 开始预处理", type="primary", use_container_width=True):
+        if st.button("⚙️ 开始预处理", type="primary", width="stretch"):
              with st.spinner(f"正在提交预处理任务..."):
                 ok, res = start_preprocessing(current_ds['path'])
                 if ok:
-                    clear_api_cache()
+                    invalidate("datasets", "raw_datasets")
                     st.success(f"任务已提交! ID: {res['task_id']}")
                     st.info("请前往 [分析任务管理] 查看进度。")
                 else:
                     st.error(f"提交失败: {res}")
 
     # File List Dataframe
-    file_list = _raw_file_rows(files)
+    file_list = _raw_file_rows(visible_files)
     
     if file_list:
-        df_files = pd.DataFrame(file_list)
-        
+        if len(files) > MAX_RAW_FILE_ROWS:
+            st.caption(f"仅展示前 {MAX_RAW_FILE_ROWS} 个文件，当前数据集共 {len(files)} 个文件。")
+        df_files = _paginated(pd.DataFrame(file_list), f"files_{ds_name}", search_cols=["Name"])
+
         # Editor
         edited_files = st.data_editor(
             df_files,
@@ -462,7 +504,8 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
             },
             hide_index=True,
             key=f"files_editor_{ds_name}", # Unique key per folder
-            use_container_width=True
+            width="stretch",
+            height=420,
         )
         
         selected_files = edited_files[edited_files["Select"]]
@@ -470,7 +513,7 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
         # Toolbar Actions (Files)
         with c_copy:
             if not selected_files.empty:
-                if st.button("📋 复制", use_container_width=True):
+                if st.button("📋 复制", width="stretch"):
                     st.session_state['clipboard'] = []
                     for _, row in selected_files.iterrows():
                         st.session_state['clipboard'].append({
@@ -483,7 +526,7 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
         with c_paste:
             clipboard = st.session_state.get('clipboard', [])
             if clipboard:
-                if st.button(f"📋 粘贴 ({len(clipboard)})", use_container_width=True):
+                if st.button(f"📋 粘贴 ({len(clipboard)})", width="stretch"):
                     success_count = 0
                     for item in clipboard:
                         if item['type'] == 'file':
@@ -493,22 +536,20 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
                             if ok: success_count += 1
                     
                     if success_count > 0:
-                        clear_api_cache()
+                        invalidate("datasets", "raw_datasets")
                         st.toast(f"成功粘贴 {success_count} 个文件")
-                        time.sleep(1)
                         st.rerun()
         
         with c_del:
             if not selected_files.empty:
-                if st.button("🗑️ 删除", type="primary", use_container_width=True):
+                if st.button("🗑️ 删除", type="primary", width="stretch"):
                     success_count = 0
                     for _, row in selected_files.iterrows():
                         ok, _ = delete_raw_file(ds_name, row['Name'])
                         if ok: success_count += 1
                     if success_count > 0:
-                        clear_api_cache()
+                        invalidate("datasets", "raw_datasets")
                         st.toast(f"已删除 {success_count} 个文件")
-                        time.sleep(1)
                         st.rerun()
     else:
         st.info("暂无文件，请导入。")
@@ -516,7 +557,7 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
         with c_paste:
             clipboard = st.session_state.get('clipboard', [])
             if clipboard:
-                 if st.button(f"📋 粘贴 ({len(clipboard)})", use_container_width=True):
+                 if st.button(f"📋 粘贴 ({len(clipboard)})", width="stretch"):
                     success_count = 0
                     for item in clipboard:
                         if item['type'] == 'file':
@@ -524,9 +565,8 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
                             if ok: success_count += 1
                     
                     if success_count > 0:
-                        clear_api_cache()
+                        invalidate("datasets", "raw_datasets")
                         st.toast(f"成功粘贴 {success_count} 个文件")
-                        time.sleep(1)
                         st.rerun()
 
 def render_processed_explorer():
@@ -553,12 +593,12 @@ def render_processed_explorer():
     
     with col_t1:
         if not is_root:
-            if st.button("⬆️ 上一级", key="proc_up", use_container_width=True):
+            if st.button("⬆️ 上一级", key="proc_up", width="stretch"):
                 st.session_state['proc_explorer_path'].pop()
                 st.rerun()
         else:
-            if st.button("🔄 刷新", key="proc_refresh", use_container_width=True):
-                clear_api_cache()
+            if st.button("🔄 刷新", key="proc_refresh", width="stretch"):
+                invalidate("datasets", "raw_datasets")
                 st.session_state['datasets_list'] = get_datasets()
                 st.rerun()
 
@@ -570,9 +610,7 @@ def render_processed_explorer():
 
 def _render_processed_root_view(c_rename, c_del, c_split):
     # Fetch Data
-    if 'datasets_list' not in st.session_state:
-        st.session_state['datasets_list'] = get_datasets()
-    datasets = st.session_state['datasets_list']
+    datasets = _get_state_list('datasets_list', get_datasets)
     
     if not datasets:
         st.info("暂无已预处理的数据集。")
@@ -594,7 +632,7 @@ def _render_processed_root_view(c_rename, c_del, c_split):
         },
         hide_index=True,
         key="proc_root_editor",
-        use_container_width=True
+        width="stretch"
     )
     
     selected_rows = edited_df[edited_df["Select"]]
@@ -602,7 +640,7 @@ def _render_processed_root_view(c_rename, c_del, c_split):
     # Actions
     with c_rename:
         if len(selected_rows) == 1:
-            if st.button("✏️ 重命名", key="ren_proc_root_btn", use_container_width=True):
+            if st.button("✏️ 重命名", key="ren_proc_root_btn", width="stretch"):
                  st.session_state['renaming_proc_ds'] = {
                      'id': selected_rows.iloc[0]['ID'],
                      'name': selected_rows.iloc[0]['Name']
@@ -610,16 +648,15 @@ def _render_processed_root_view(c_rename, c_del, c_split):
 
     with c_del:
         if not selected_rows.empty:
-            if st.button("🗑️ 删除", key="del_proc_root_btn", type="primary", use_container_width=True):
+            if st.button("🗑️ 删除", key="del_proc_root_btn", type="primary", width="stretch"):
                  count = 0
                  for _, row in selected_rows.iterrows():
                      ok, _ = delete_dataset(row['ID'])
                      if ok: count += 1
                  if count > 0:
-                     clear_api_cache()
+                     invalidate("datasets", "raw_datasets")
                      st.toast(f"已删除 {count} 个数据集")
                      st.session_state['datasets_list'] = get_datasets()
-                     time.sleep(1)
                      st.rerun()
 
     # Rename Modal Logic
@@ -637,7 +674,7 @@ def _render_processed_root_view(c_rename, c_del, c_split):
                      if new_name and new_name != target['name']:
                          ok, res = rename_dataset(target['id'], new_name)
                          if ok:
-                             clear_api_cache()
+                             invalidate("datasets", "raw_datasets")
                              st.success("成功")
                              st.session_state['datasets_list'] = get_datasets()
                              del st.session_state['renaming_proc_ds']
@@ -661,7 +698,7 @@ def _render_processed_root_view(c_rename, c_del, c_split):
 
 def _render_processed_dataset_view(dataset_id, c_del, c_split):
     # Get dataset
-    datasets = st.session_state.get('datasets_list', get_datasets())
+    datasets = _get_state_list('datasets_list', get_datasets)
     ds = next((d for d in datasets if d['id'] == dataset_id), None)
     
     if not ds:
@@ -675,7 +712,7 @@ def _render_processed_dataset_view(dataset_id, c_del, c_split):
     
     # Split Action
     with c_split:
-        if st.button("✂️ 划分数据集", use_container_width=True):
+        if st.button("✂️ 划分数据集", width="stretch"):
              st.session_state['show_split_modal'] = True
              
     if st.session_state.get('show_split_modal'):
@@ -687,7 +724,7 @@ def _render_processed_dataset_view(dataset_id, c_del, c_split):
             if st.button("确认划分", type="primary"):
                  ok, res = split_dataset(ds['id'], train_ratio, val_ratio)
                  if ok:
-                     clear_api_cache()
+                     invalidate("datasets", "raw_datasets")
                      st.success(f"划分成功! Train: {res['splits']['train']}, Val: {res['splits']['val']}, Test: {res['splits']['test']}")
                      st.session_state['show_split_modal'] = False
                  else:
@@ -697,11 +734,15 @@ def _render_processed_dataset_view(dataset_id, c_del, c_split):
             st.divider()
 
     # Samples List
-    raw_stats = ds.get('stats', {}).get('raw_stats', [])
+    raw_stats = get_dataset_graphs(dataset_id)
+    visible_stats = raw_stats[:MAX_GRAPH_SAMPLE_ROWS]
     
     if raw_stats:
-        df_samples = pd.DataFrame(_sample_rows(raw_stats))
-        
+        if len(raw_stats) > MAX_GRAPH_SAMPLE_ROWS:
+            st.caption(f"仅展示前 {MAX_GRAPH_SAMPLE_ROWS} 条样本，完整数据共 {len(raw_stats)} 条。")
+        df_samples = _paginated(pd.DataFrame(_sample_rows(visible_stats)),
+                                f"samples_{dataset_id}", search_cols=["Report ID", "Group", "Vendor"])
+
         edited_samples = st.data_editor(
             df_samples,
             column_config={
@@ -715,39 +756,31 @@ def _render_processed_dataset_view(dataset_id, c_del, c_split):
             },
             hide_index=True,
             key=f"samples_editor_{dataset_id}",
-            use_container_width=True
+            width="stretch",
+            height=420,
         )
         
         selected_samples = edited_samples[edited_samples["Select"]]
         
         with c_del:
             if not selected_samples.empty:
-                if st.button("🗑️ 删除样本", type="primary", use_container_width=True):
+                if st.button("🗑️ 删除样本", type="primary", width="stretch"):
                     count = 0
                     for _, row in selected_samples.iterrows():
                         ok, _ = delete_graph(dataset_id, row['Report ID'])
                         if ok: count += 1
                     if count > 0:
-                        clear_api_cache()
+                        invalidate("datasets", "raw_datasets")
                         st.toast(f"已删除 {count} 个样本")
                         # Refresh dataset info (requires backend call)
                         st.session_state['datasets_list'] = get_datasets()
-                        time.sleep(1)
                         st.rerun()
     else:
         st.info("该数据集无详细样本信息 (可能是旧版本数据或非图数据集)。")
 
 
 def render_datasets():
-    st.markdown("""
-    <div style="display: flex; align-items: center; margin-bottom: 2rem;">
-        <div style="font-size: 2.5rem; margin-right: 1rem; color: #00d4ff; filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.3));"><i class="fas fa-database"></i></div>
-        <div>
-            <h1 style="margin: 0; font-size: 2.2rem;">数据集管理</h1>
-            <p style="color: #00d4ff; margin: 0; opacity: 0.8; letter-spacing: 1px;">Dataset & Samples Management</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    ui.page_header("数据集管理", "Dataset & Samples Management", icon="fa-database")
 
     tab_processed, tab_raw = st.tabs(["📦 已预处理数据集 (Processed)", "📂 未处理数据集 (Raw)"])
 

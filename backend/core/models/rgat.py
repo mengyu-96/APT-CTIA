@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GATv2Conv, RGCNConv, GlobalAttention, global_mean_pool
+from torch_geometric.nn import GATConv, GATv2Conv, RGCNConv, global_mean_pool
+from torch_geometric.nn.aggr import AttentionalAggregation
 
 class RGAPTiveFusion(nn.Module):
     """
@@ -112,7 +113,7 @@ class RelationAwareGAT(torch.nn.Module):
         # --- Readout: Global Attention Pooling (Innovation Point 4) ---
         # Computes importance of each node for the graph representation
         if self.pooling_mode == "attention":
-            self.attention_pool = GlobalAttention(
+            self.attention_pool = AttentionalAggregation(
                 gate_nn=nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim // 2),
                     nn.Tanh(),

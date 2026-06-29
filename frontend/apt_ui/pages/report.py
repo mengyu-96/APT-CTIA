@@ -1,29 +1,26 @@
 import streamlit as st
-import time
-import requests
-import json
 import os
-from apt_ui.services.api_client import get_json
+from apt_ui.services.api_client import get_json, request
+from apt_ui.services.tasks import get_task_detail, list_tasks
+from apt_ui.services import ui
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5001")
 
 def render_report():
-    st.markdown("""
-    <div style="display: flex; align-items: center; margin-bottom: 2rem;">
-        <div style="font-size: 2.5rem; margin-right: 1rem; color: #00d4ff; filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.3));"><i class="fas fa-file-alt"></i></div>
-        <div>
-            <h1 style="margin: 0; font-size: 2.2rem;">报告生成与导出</h1>
-            <p style="color: #00d4ff; margin: 0; opacity: 0.8; letter-spacing: 1px;">Report Generation & Export</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    ui.page_header("报告生成与导出", "Report Generation & Export", icon="fa-file-alt")
 
     c1, c2 = st.columns([1, 2], gap="large")
 
     with c1:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.subheader("报告配置")
-        
+        with ui.section_card("报告配置", icon="fa-gear"):
+            _render_report_config()
+
+    with c2:
+        with ui.section_card("报告预览与下载", icon="fa-file-pdf"):
+            _render_report_preview()
+
+
+def _render_report_config():
         # 1. Select Source Type (Training vs Attribution)
         source_type = st.radio("数据来源", ["归因任务 (Inference)", "训练任务 (Training)"], horizontal=True)
         
@@ -45,9 +42,7 @@ def render_report():
                  
         else:
             # Select from completed training tasks
-            completed_tasks = [t for t in st.session_state.get('training_history', []) if t.get('status') == 'completed']
-            # Also fetch from backend if session state empty?
-            # For now rely on session state or implement fetch
+            completed_tasks = [t for t in list_tasks(task_type="train", limit=40, ttl="default", timeout=5) if t.get('status') == 'completed']
             
             if completed_tasks:
                 task_options = {f"{t['id'][:8]} - {t['model']} ({t['dataset']})": t for t in completed_tasks}
@@ -70,8 +65,8 @@ def render_report():
             default=["执行摘要", "归因结论", "IOCs"]
         )
         
-        st.markdown("---")
-        if st.button("生成报告", type="primary", use_container_width=True):
+        st.divider()
+        if st.button("生成报告", type="primary", width="stretch"):
             if not task_id:
                 st.error("请选择或输入任务 ID")
             else:
@@ -102,8 +97,9 @@ def render_report():
                         }
                         
                     elif source_type == "训练任务 (Training)" and selected_task:
-                         if selected_task.get('result'):
-                            res = selected_task['result']
+                         task_detail = get_task_detail(task_id) if task_id else {}
+                         res = task_detail.get('result') or selected_task.get('result')
+                         if res:
                             # Extract top attribution from classification report if available
                             top_attr = "Unknown"
                             attributions = []
@@ -134,10 +130,15 @@ def render_report():
                             }
 
                     try:
-                        response = requests.post(f"{BACKEND_URL}/api/generate_report", json={
-                            "task_id": task_id,
-                            "analysis_results": analysis_results
-                        }, timeout=30)
+                        response = request(
+                            "POST",
+                            "/api/generate_report",
+                            json_body={
+                                "task_id": task_id,
+                                "analysis_results": analysis_results,
+                            },
+                            timeout=30,
+                        )
                         
                         if response.status_code == 200:
                             result = response.json()
@@ -147,49 +148,30 @@ def render_report():
                             st.error(f"生成失败: {response.text}")
                     except Exception as e:
                         st.error(f"连接后端失败: {e}")
-            
-        st.markdown('</div>', unsafe_allow_html=True)
 
-    with c2:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.subheader("报告预览与下载")
-        
+
+def _render_report_preview():
         if st.session_state.get('report_generated'):
             report_info = st.session_state['report_generated']
             report_url = f"{BACKEND_URL}{report_info['report_url']}"
-            
+
             st.success("✅ PDF 报告已就绪")
             st.markdown(f"**文件路径:** `{report_info['report_path']}`")
-            
-            # Preview (Mock, since browsers can't easily embed local PDFs without serving them properly)
-            # But we can provide a download link
-            st.markdown(f"""
-            <div style="text-align: center; padding: 2rem;">
-                <a href="{report_url}" target="_blank" style="text-decoration: none;">
-                    <div style="background: linear-gradient(135deg, #0099cc 0%, #006699 100%); color: white; padding: 1rem 2rem; border-radius: 8px; display: inline-block;">
-                        📥 点击下载 PDF 报告
-                    </div>
-                </a>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Simple text preview
-            st.markdown("### 内容概览")
-            st.markdown("""
-            > **执行摘要**
-            >
-            > 本报告针对任务提交的样本数据进行了深入的自动化分析。系统利用基于图神经网络 (GNN) 的深度学习模型，对样本的行为特征进行了提取与聚类。分析结果显示，目标样本与已知 APT 组织 **APT28** 具有高度相似性。
-            """)
-            
-        else:
-            st.info("请在左侧配置并点击“生成报告”按钮。")
-            st.markdown("""
-            <div style="height: 400px; display: flex; align-items: center; justify-content: center; border: 2px dashed rgba(0, 212, 255, 0.2); border-radius: 8px;">
-                <div style="text-align: center; color: #aaa;">
-                    <i class="fas fa-file-pdf" style="font-size: 3rem; margin-bottom: 1rem;"></i>
-                    <p>预览区域</p>
+
+            st.markdown(
+                f"""
+                <div style="text-align: center; padding: 1.5rem 0;">
+                    <a href="{report_url}" target="_blank" style="text-decoration: none;">
+                        <span style="background: linear-gradient(135deg, #0099cc 0%, #00d4ff 100%);
+                              color: #00121d; font-weight: 700; padding: 0.7rem 1.6rem;
+                              border-radius: 8px; display: inline-block;">
+                            📥 点击下载 PDF 报告
+                        </span>
+                    </a>
                 </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        st.markdown('</div>', unsafe_allow_html=True)
+                """,
+                unsafe_allow_html=True,
+            )
+            st.caption("PDF 在新标签页打开；如需嵌入预览，请下载后本地查看。")
+        else:
+            ui.empty_state("请在左侧配置并点击「生成报告」按钮。", icon="fa-file-pdf")

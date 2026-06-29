@@ -1,265 +1,204 @@
-import streamlit as st
+from __future__ import annotations
+
 import pandas as pd
 import plotly.express as px
-import requests
-import time
-import os
-from apt_ui.services.api_client import clear_api_cache, get_json
+import streamlit as st
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5001")
+from apt_ui.services.api_client import invalidate, get_json, request
+from apt_ui.services.charting import PLOTLY_CHART_CONFIG, apply_layout
+from apt_ui.services import ui
 
-def get_models():
-    return get_json("/api/models", timeout=5, default=[])
 
-def rename_model(model_id, new_name):
+def _get_models() -> list[dict]:
+    return get_json("/api/models", timeout=4, default=[])
+
+
+def _get_model_detail(model_id: str) -> dict | None:
+    return get_json(f"/api/models/{model_id}", timeout=5, default=None, ttl="slow")
+
+
+def _rename_model(model_id: str, new_name: str) -> tuple[bool, str]:
     try:
-        response = requests.put(f"{BACKEND_URL}/api/models/{model_id}/rename", json={"new_name": new_name}, timeout=5)
+        response = request("PUT", f"/api/models/{model_id}/rename", json_body={"new_name": new_name}, timeout=5)
         if response.status_code == 200:
-            return True, response.json()
-        else:
-            return False, response.json().get('error', 'Unknown error')
-    except Exception as e:
-        return False, str(e)
+            return True, "模型已重命名。"
+        payload = response.json()
+        return False, payload.get("error", "未知错误")
+    except Exception as exc:
+        return False, str(exc)
 
-def delete_model(model_id):
+
+def _delete_model(model_id: str) -> tuple[bool, str]:
     try:
-        response = requests.delete(f"{BACKEND_URL}/api/models/{model_id}", timeout=5)
+        response = request("DELETE", f"/api/models/{model_id}", timeout=5)
         if response.status_code == 200:
-            return True, "删除成功"
-        else:
-            return False, response.json().get('error', 'Unknown error')
-    except Exception as e:
-        return False, str(e)
+            return True, "模型已删除。"
+        payload = response.json()
+        return False, payload.get("error", "未知错误")
+    except Exception as exc:
+        return False, str(exc)
+
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _models_dataframe(models):
+def _models_df(models: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(models)
 
+
 @st.cache_data(ttl=300, show_spinner=False)
-def _class_report_dataframe(report):
-    class_data = []
-    for k, v in report.items():
-        if k not in ['accuracy', 'macro avg', 'weighted avg'] and isinstance(v, dict):
-            class_data.append({
-                'Class': k,
-                'Precision': v['precision'],
-                'Recall': v['recall'],
-                'F1-Score': v['f1-score'],
-                'Support': v['support']
-            })
-    return pd.DataFrame(class_data)
+def _class_report_df(report: dict) -> pd.DataFrame:
+    rows = []
+    for label, metrics in report.items():
+        if label in {"accuracy", "macro avg", "weighted avg"} or not isinstance(metrics, dict):
+            continue
+        rows.append(
+            {
+                "Class": label,
+                "Precision": metrics.get("precision", 0.0),
+                "Recall": metrics.get("recall", 0.0),
+                "F1-Score": metrics.get("f1-score", 0.0),
+                "Support": metrics.get("support", 0),
+            }
+        )
+    return pd.DataFrame(rows)
 
-def render_models():
-    st.markdown("""
-    <div style="display: flex; align-items: center; margin-bottom: 2rem;">
-        <div style="font-size: 2.5rem; margin-right: 1rem; color: #00d4ff; filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.3));"><i class="fas fa-brain"></i></div>
-        <div>
-            <h1 style="margin: 0; font-size: 2.2rem;">模型管理</h1>
-            <p style="color: #00d4ff; margin: 0; opacity: 0.8; letter-spacing: 1px;">Model Registry & Performance</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
 
-    # Fetch Models
-    if 'models_list' not in st.session_state:
-        st.session_state['models_list'] = get_models()
-    
-    models = st.session_state['models_list']
+def render_models() -> None:
+    ui.page_header("模型管理", "Model Management", icon="fa-microchip")
 
-    # Refresh Button
-    if st.button("🔄 刷新列表"):
-        clear_api_cache()
-        st.session_state['models_list'] = get_models()
+    if ui.refresh_button("refresh_models", label="刷新模型列表"):
+        invalidate("models")
         st.rerun()
 
+    models = _get_models()
     if not models:
-         st.info("暂无已训练的模型。请前往 [模型训练] 页面进行模型训练。")
-         return
+        st.info("暂无已训练模型，请先在「模型训练」页面提交训练任务。")
+        return
 
-    # Model Performance Chart
-    st.subheader("模型性能对比")
-    df_perf = _models_dataframe(models)
-    
-    col_chart, col_info = st.columns([2, 1])
-    
-    with col_chart:
-        if not df_perf.empty:
-            fig = px.bar(df_perf, x='name', y=['accuracy', 'f1_score'], barmode='group',
-                        color_discrete_sequence=['#00d4ff', '#0099cc'])
-            fig.update_layout(
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-                font_color='#ffffff',
-                xaxis_title="模型名称",
-                yaxis_title="分数",
-                legend_title="指标",
-                margin=dict(t=0, b=0, l=0, r=0)
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    latest_model = models[0]
+    ui.metric_row([
+        ("模型数量", len(models)),
+        ("最新模型 Accuracy", f"{latest_model.get('accuracy', 0):.3f}"),
+        ("最新模型 F1", f"{latest_model.get('f1_score', 0):.3f}"),
+    ])
 
-    with col_info:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("#### 最新模型")
-        # Just pick the first one as they are sorted by date desc
-        latest_model = models[0] if models else None
-        if latest_model:
-            st.metric("模型名称", latest_model['name'])
-            st.metric("准确率 (Accuracy)", f"{latest_model['accuracy']:.3f}")
-            st.metric("F1 分数", f"{latest_model['f1_score']:.3f}")
-            st.caption(f"创建时间: {latest_model['created']}")
-        else:
-            st.warning("无模型")
-        st.markdown('</div>', unsafe_allow_html=True)
+    chart_col, info_col = st.columns([2, 1], gap="large")
+    with chart_col:
+        with ui.section_card("模型指标对比", icon="fa-chart-column"):
+            df_perf = _models_df(models)
+            fig = px.bar(df_perf, x="name", y=["accuracy", "f1_score"], barmode="group")
+            apply_layout(fig, xaxis_title="模型名称", yaxis_title="分数")
+            st.plotly_chart(fig, width="stretch", config=PLOTLY_CHART_CONFIG)
 
-    st.markdown("###")
-    st.subheader("模型列表")
+    with info_col:
+        with ui.section_card("最新模型", icon="fa-star"):
+            st.metric("名称", latest_model["name"])
+            st.metric("数据集", latest_model.get("dataset_name", "Unknown"))
+            st.caption(f"Batch Size: {latest_model.get('batch_size', 32)} · 创建时间: {latest_model.get('created', '-')}")
 
-    # Filter/Search
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        search_term = st.text_input("搜索模型", placeholder="模型名称...")
-    with c2:
-        status_filter = st.selectbox("状态筛选", ["全部", "Completed"]) # Only Completed for now
+    search_col, _ = st.columns([2, 3])
+    with search_col:
+        keyword = st.text_input("搜索模型", placeholder="按模型名称筛选")
 
-    # Filter Logic
-    filtered_models = []
-    for m in models:
-        match_search = search_term.lower() in m['name'].lower()
-        match_status = status_filter == "全部" or status_filter == m['status']
-        if match_search and match_status:
-            filtered_models.append(m)
+    filtered_models = [item for item in models if keyword.lower() in item["name"].lower()]
 
-    # Detailed Analysis View (Drill-down)
-    if 'selected_model_id' in st.session_state and st.session_state['selected_model_id']:
-        sel_model = next((m for m in filtered_models if m['id'] == st.session_state['selected_model_id']), None)
-        if sel_model:
-            with st.expander(f"📊 {sel_model['name']} - 详细评估报告", expanded=True):
-                mc1, mc2 = st.columns([1, 1])
-                with mc1:
-                    st.markdown("#### 混淆矩阵数据")
-                    # Check if confusion matrix data is available in classification_report or similar
-                    # Backend currently returns classification_report dict. 
-                    # We might not have raw CM unless saved. 
-                    # But we can visualize the per-class precision/recall/f1 from classification_report.
-                    
-                    report = sel_model.get('classification_report', {})
-                    if report:
-                        df_cls = _class_report_dataframe(report)
-                        if not df_cls.empty:
-                            fig_cls = px.bar(df_cls, x='Class', y=['Precision', 'Recall', 'F1-Score'],
-                                            barmode='group', title="各类别性能指标")
-                            fig_cls.update_layout(
-                                paper_bgcolor='rgba(0,0,0,0)',
-                                plot_bgcolor='rgba(0,0,0,0)',
-                                font_color='#ffffff'
-                            )
-                            st.plotly_chart(fig_cls, use_container_width=True)
-                        else:
-                            st.info("无详细分类报告数据")
+    selected_model_id = st.session_state.get("selected_model_id")
+    if selected_model_id:
+        detail = _get_model_detail(selected_model_id)
+        if detail:
+            with ui.section_card():
+                detail_title_col, close_col = st.columns([5, 1])
+                with detail_title_col:
+                    st.markdown(
+                        f'<div class="section-title"><i class="fas fa-circle-info"></i>'
+                        f'<span>模型详情：{detail["name"]}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                with close_col:
+                    if st.button("关闭详情", width="stretch"):
+                        st.session_state["selected_model_id"] = None
+                        st.rerun()
+
+                report = detail.get("classification_report") or {}
+                report_df = _class_report_df(report)
+                left, right = st.columns([1.3, 1], gap="large")
+                with left:
+                    if not report_df.empty:
+                        fig_cls = px.bar(report_df, x="Class",
+                                         y=["Precision", "Recall", "F1-Score"], barmode="group")
+                        apply_layout(fig_cls)
+                        st.plotly_chart(fig_cls, width="stretch", config=PLOTLY_CHART_CONFIG)
                     else:
-                        st.info("无分类报告")
+                        st.info("当前模型没有详细分类报告。")
+                with right:
+                    st.caption(f"Epochs: {detail.get('epochs', 0)} · Batch Size: {detail.get('batch_size', 32)}")
+                    macro = report.get("macro avg", {})
+                    weighted = report.get("weighted avg", {})
+                    radar_df = pd.DataFrame({
+                        "metric": ["Accuracy", "Macro Precision", "Macro Recall", "Macro F1", "Weighted F1"],
+                        "value": [
+                            report.get("accuracy", 0.0),
+                            macro.get("precision", 0.0),
+                            macro.get("recall", 0.0),
+                            macro.get("f1-score", 0.0),
+                            weighted.get("f1-score", 0.0),
+                        ],
+                    })
+                    fig_radar = px.line_polar(radar_df, r="value", theta="metric", line_close=True)
+                    fig_radar.update_traces(fill="toself")
+                    apply_layout(fig_radar, polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
+                    st.plotly_chart(fig_radar, width="stretch", config=PLOTLY_CHART_CONFIG)
 
-                with mc2:
-                    st.markdown("#### 综合指标雷达图")
-                    # Radar chart for overall metrics
-                    if report:
-                        macro = report.get('macro avg', {})
-                        weighted = report.get('weighted avg', {})
-                        acc = report.get('accuracy', 0)
-                        
-                        categories = ['Accuracy', 'Macro Precision', 'Macro Recall', 'Macro F1', 'Weighted F1']
-                        values = [
-                            acc,
-                            macro.get('precision', 0),
-                            macro.get('recall', 0),
-                            macro.get('f1-score', 0),
-                            weighted.get('f1-score', 0)
-                        ]
-                        
-                        df_radar = pd.DataFrame(dict(
-                            r=values,
-                            theta=categories
-                        ))
-                        fig_radar = px.line_polar(df_radar, r='r', theta='theta', line_close=True)
-                        fig_radar.update_traces(fill='toself')
-                        fig_radar.update_layout(
-                            paper_bgcolor='rgba(0,0,0,0)',
-                            polar=dict(
-                                bgcolor='rgba(0,0,0,0)',
-                                radialaxis=dict(visible=True, range=[0, 1], showticklabels=False),
-                                angularaxis=dict(color='white')
-                            ),
-                            font_color='#ffffff',
-                            margin=dict(t=20, b=20)
-                        )
-                        st.plotly_chart(fig_radar, use_container_width=True)
+                if not report_df.empty:
+                    st.dataframe(report_df, width="stretch", hide_index=True)
 
-                if st.button("关闭详情", key="close_detail"):
-                    st.session_state['selected_model_id'] = None
-                    st.rerun()
-            st.divider()
-
-    # Table Header
-    cols = st.columns([3, 2, 2, 1, 1, 1, 2, 3])
-    cols[0].markdown("**模型名称**")
-    cols[1].markdown("**类型**")
-    cols[2].markdown("**训练数据集**")
-    cols[3].markdown("**准确率**")
-    cols[4].markdown("**F1**")
-    cols[5].markdown("**轮数**")
-    cols[6].markdown("**状态**")
-    cols[7].markdown("**操作**")
-    st.divider()
+    st.markdown('<div class="section-title"><i class="fas fa-layer-group"></i><span>模型列表</span></div>', unsafe_allow_html=True)
+    if not filtered_models:
+        st.info("没有匹配的模型。")
+        return
 
     for idx, model in enumerate(filtered_models):
-        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([3, 2, 2, 1, 1, 1, 2, 3])
-        
-        with c1:
-            st.markdown(f"**{model['name']}**")
-            # Add View Details button/link
-            if st.button("👁️ 详情", key=f"view_{idx}", help="查看详细评估指标"):
-                st.session_state['selected_model_id'] = model['id']
-                st.rerun()
-        with c2:
-            st.caption(model['type'])
-        with c3:
-            st.caption(model.get('dataset_name', model.get('dataset_id', 'Unknown')))
-        with c4:
-            st.markdown(f"{model['accuracy']:.3f}")
-        with c5:
-            st.markdown(f"{model['f1_score']:.3f}")
-        with c6:
-            st.markdown(model['epochs'])
-        with c7:
-            status_color = "#4CAF50" if model['status'] == "Completed" else "#9E9E9E"
-            st.markdown(f"<span style='color:{status_color}; font-weight:bold;'>● {model['status']}</span>", unsafe_allow_html=True)
-        with c8:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                # Edit/Rename
-                with st.expander("✏️"):
-                    new_name = st.text_input("重命名", value=model['name'], key=f"ren_model_{idx}")
-                    if st.button("确认", key=f"ren_model_btn_{idx}"):
-                         ok, res = rename_model(model['id'], new_name)
-                         if ok:
-                             clear_api_cache()
-                             st.success("成功")
-                             st.session_state['models_list'] = get_models()
-                             time.sleep(1)
-                             st.rerun()
-                         else:
-                             st.error(f"失败: {res}")
+        with ui.section_card():
+            title_col, stat_col, action_col = st.columns([3, 2, 2], gap="large")
 
-            with col_b:
-                if st.button("🗑️", key=f"del_m_{idx}"):
-                    success, msg = delete_model(model['id'])
-                    if success:
-                        clear_api_cache()
-                        st.toast(f"模型 {model['name']} 已删除", icon="🗑️")
-                        st.session_state['models_list'] = [m for m in st.session_state['models_list'] if m['id'] != model['id']]
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error(f"删除失败: {msg}")
-        
-        st.markdown("---")
+            with title_col:
+                st.markdown(f"**{model['name']}**")
+                st.caption(
+                    f"类型: {model.get('type', 'Unknown')} · 数据集: {model.get('dataset_name', 'Unknown')} · "
+                    f"轮数: {model.get('epochs', 0)} · Batch Size: {model.get('batch_size', 32)} · 创建: {model.get('created', '-')}"
+                )
+
+            with stat_col:
+                c1, c2 = st.columns(2)
+                c1.metric("Accuracy", f"{model.get('accuracy', 0):.3f}")
+                c2.metric("F1", f"{model.get('f1_score', 0):.3f}")
+
+            with action_col:
+                if st.button(f"👁️ {ui.ACTION_LABELS['view']}", key=f"view_model_{idx}", width="stretch"):
+                    st.session_state["selected_model_id"] = model["id"]
+                    st.rerun()
+
+                rename_key = f"rename_value_{model['id']}"
+                if rename_key not in st.session_state:
+                    st.session_state[rename_key] = model["name"]
+                st.text_input("新名称", key=rename_key, label_visibility="collapsed",
+                              placeholder="输入新名称…")
+
+                rename_col, delete_col = st.columns(2)
+                with rename_col:
+                    if st.button(f"✏️ {ui.ACTION_LABELS['rename']}", key=f"rename_model_{idx}", width="stretch"):
+                        ok, message = _rename_model(model["id"], st.session_state[rename_key].strip())
+                        if ok:
+                            invalidate("models")
+                            st.toast(message, icon="✅")
+                            st.rerun()
+                        st.error(message)
+                with delete_col:
+                    if st.button(f"🗑️ {ui.ACTION_LABELS['delete']}", key=f"delete_model_{idx}", width="stretch"):
+                        ok, message = _delete_model(model["id"])
+                        if ok:
+                            invalidate("models")
+                            if st.session_state.get("selected_model_id") == model["id"]:
+                                st.session_state["selected_model_id"] = None
+                            st.toast(message, icon="✅")
+                            st.rerun()
+                        st.error(message)

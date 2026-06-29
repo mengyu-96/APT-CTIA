@@ -5,6 +5,8 @@ import os
 import shutil
 import datetime
 import logging
+import time
+from typing import Any
 
 from core.preprocess import run_preprocessing_pipeline
 from core.train import run_training_pipeline
@@ -87,6 +89,266 @@ import json
 # 简单的文件持久化任务队列
 TASK_QUEUE_FILE = RESULTS_ARCHIVE / 'tasks.json'
 TASK_QUEUE = {}
+TASK_QUEUE_LOCK = threading.Lock()
+TASK_SAVE_MIN_INTERVAL_SEC = 0.5
+_LAST_TASK_SAVE_TS = 0.0
+ACTIVE_TASK_STATUSES = {'pending', 'running'}
+
+
+def _snapshot_tasks_unlocked():
+    return json.dumps(TASK_QUEUE, indent=2, ensure_ascii=False)
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | list[Any] | None:
+    try:
+        with path.open('r', encoding='utf-8') as fp:
+            return json.load(fp)
+    except Exception as exc:
+        logging.warning("Failed to read JSON from %s: %s", path, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Lightweight read-through caches for hot GET endpoints.
+#
+# Dataset listing and per-graph stats are read from disk on every poll, which
+# becomes the dominant cost (and the source of frontend stutter) once there
+# are many / large datasets. We cache by a freshness signature so results stay
+# correct automatically: a file cache keys on (path, mtime, size); a directory
+# cache keys on a signature built from each child's name + mtime. When the
+# signature is unchanged the cached payload is reused with no disk work.
+# ---------------------------------------------------------------------------
+_FILE_JSON_CACHE: dict[str, tuple[tuple[float, int], Any]] = {}
+_FILE_JSON_CACHE_LOCK = threading.Lock()
+_DIR_PAYLOAD_CACHE: dict[str, tuple[Any, Any]] = {}
+_DIR_PAYLOAD_CACHE_LOCK = threading.Lock()
+
+
+def _read_json_cached(path: Path) -> Any:
+    """Read a JSON file, reusing the parsed result while mtime/size are stable."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    sig = (stat.st_mtime, stat.st_size)
+    key = str(path)
+    with _FILE_JSON_CACHE_LOCK:
+        cached = _FILE_JSON_CACHE.get(key)
+        if cached and cached[0] == sig:
+            return cached[1]
+    data = _read_json_file(path)
+    with _FILE_JSON_CACHE_LOCK:
+        _FILE_JSON_CACHE[key] = (sig, data)
+    return data
+
+
+def _dir_signature(root: Path) -> tuple:
+    """A cheap signature that changes when a directory's children change."""
+    if not root.exists():
+        return ()
+    entries = []
+    try:
+        for child in root.iterdir():
+            try:
+                st_ = child.stat()
+                entries.append((child.name, st_.st_mtime, st_.st_size))
+            except OSError:
+                continue
+    except OSError:
+        return ()
+    entries.sort()
+    return tuple(entries)
+
+
+def _dir_cache_get(key: str, signature: Any) -> Any | None:
+    with _DIR_PAYLOAD_CACHE_LOCK:
+        cached = _DIR_PAYLOAD_CACHE.get(key)
+        if cached and cached[0] == signature:
+            return cached[1]
+    return None
+
+
+def _dir_cache_set(key: str, signature: Any, payload: Any) -> None:
+    with _DIR_PAYLOAD_CACHE_LOCK:
+        _DIR_PAYLOAD_CACHE[key] = (signature, payload)
+
+
+def _find_inference_result_dir(task_id: str) -> Path | None:
+    if not task_id or not ATTRIBUTION_RESULTS_DIR.exists():
+        return None
+    matches = sorted(ATTRIBUTION_RESULTS_DIR.glob(f"*_{task_id}"))
+    for candidate in reversed(matches):
+        if candidate.is_dir() and (candidate / 'inference_results.json').exists():
+            return candidate
+    return None
+
+
+def _build_result_ref(task_type: str, result: Any, task: dict[str, Any]) -> dict[str, str] | None:
+    if not isinstance(result, dict):
+        return None
+
+    if task_type == 'train':
+        model_path = result.get('model_path')
+        if model_path:
+            return {"kind": "train_run", "path": str(Path(model_path).resolve().parent)}
+
+    if task_type == 'inference':
+        output_dir = result.get('output_dir') or task.get('output_dir')
+        if not output_dir:
+            found_dir = _find_inference_result_dir(str(task.get('id', '')))
+            if found_dir:
+                output_dir = str(found_dir)
+        if output_dir:
+            return {"kind": "inference_run", "path": str(Path(output_dir).resolve())}
+
+    if task_type == 'preprocess':
+        output_path = result.get('output_path') or task.get('output_dir')
+        if output_path:
+            return {"kind": "preprocess_run", "path": str(Path(output_path).resolve())}
+
+    return None
+
+
+def _summarize_task_result(task_type: str, result: Any, task: dict[str, Any]) -> Any:
+    if not isinstance(result, dict):
+        return result
+
+    if task_type == 'train':
+        return {
+            "test_accuracy": result.get("test_accuracy", 0.0),
+            "test_f1_weighted": result.get("test_f1_weighted", 0.0),
+            "temperature": result.get("temperature"),
+            "model_path": result.get("model_path"),
+            "history_plot": result.get("history_plot"),
+            "confusion_matrix_plot": result.get("confusion_matrix_plot"),
+        }
+
+    if task_type == 'inference':
+        return {
+            "total_samples": result.get("total_samples", 0),
+            "label_distribution": result.get("label_distribution", {}),
+            "output_dir": result.get("output_dir") or task.get("output_dir"),
+        }
+
+    if task_type == 'preprocess':
+        return {
+            "output_path": result.get("output_path"),
+            "label_mapping_path": result.get("label_mapping_path"),
+            "graph_stats_path": result.get("graph_stats_path"),
+        }
+
+    return result
+
+
+def _load_task_result(task: dict[str, Any]) -> Any:
+    ref = task.get('result_ref') or {}
+    if not ref:
+        return task.get('result_summary')
+
+    path_str = ref.get('path')
+    kind = ref.get('kind')
+    if not path_str:
+        return task.get('result_summary')
+
+    path = Path(path_str)
+    if kind == 'train_run':
+        results = _read_json_file(path / 'results.json')
+        return results if isinstance(results, dict) else task.get('result_summary')
+
+    if kind == 'inference_run':
+        results = _read_json_file(path / 'inference_results.json')
+        if isinstance(results, dict):
+            results.setdefault('output_dir', str(path))
+            return results
+        return task.get('result_summary')
+
+    if kind == 'preprocess_run':
+        summary = dict(task.get('result_summary') or {})
+        summary.setdefault('output_path', str(path))
+        return summary
+
+    return task.get('result_summary')
+
+
+def _normalize_task_record(task_id: str, task: dict[str, Any]) -> bool:
+    changed = False
+    task['id'] = task_id
+
+    legacy_result = task.pop('result', None)
+    if legacy_result is not None:
+        task_type = task.get('type', 'unknown')
+        task['result_summary'] = _summarize_task_result(task_type, legacy_result, task)
+        result_ref = _build_result_ref(task_type, legacy_result, task)
+        if result_ref:
+            task['result_ref'] = result_ref
+        changed = True
+
+    if task.get('type') == 'inference' and not task.get('result_ref'):
+        result_dir = _find_inference_result_dir(task_id)
+        if result_dir:
+            task['result_ref'] = {"kind": "inference_run", "path": str(result_dir.resolve())}
+            task.setdefault('output_dir', str(result_dir.resolve()))
+            changed = True
+
+    return changed
+
+
+def _task_list_item(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    item_type = task.get('type', 'unknown')
+    config = task.get('config', {}) if isinstance(task.get('config'), dict) else {}
+    task_info = {
+        "id": task_id,
+        "status": task.get('status'),
+        "type": item_type,
+        "created": task.get('created_at', ''),
+        "progress": task.get('progress', 0),
+        "message": task.get('message', ''),
+        "error": task.get('error'),
+        "name": task.get('dataset_name') or task.get('output_name') or f"{item_type} task",
+        "files": task.get('file_count', len(task.get('files', [])) if isinstance(task.get('files'), list) else 0),
+    }
+
+    if item_type == 'train':
+        task_info['model'] = config.get('model_type')
+        task_info['dataset'] = config.get('dataset_name')
+        task_info['name'] = f"Train {task_info['model']}"
+
+    if item_type == 'inference':
+        task_info['name'] = "Attribution Inference"
+        task_info['model'] = config.get('model_id')
+        task_info['dataset'] = config.get('dataset_id')
+
+    result_summary = task.get('result_summary')
+    if isinstance(result_summary, dict):
+        if item_type == 'train':
+            task_info['accuracy'] = result_summary.get('test_accuracy')
+            task_info['f1'] = result_summary.get('test_f1_weighted')
+        if item_type == 'inference':
+            task_info['total_samples'] = result_summary.get('total_samples', 0)
+
+    return task_info
+
+
+def _task_detail_payload(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(task)
+    payload['id'] = task_id
+    payload['result'] = _load_task_result(task)
+    return payload
+
+
+def set_task_fields(task_id, *, force_save=False, **fields):
+    changed = False
+    with TASK_QUEUE_LOCK:
+        task = TASK_QUEUE.get(task_id)
+        if not task:
+            return False
+        for key, value in fields.items():
+            if task.get(key) != value:
+                task[key] = value
+                changed = True
+    if changed:
+        save_tasks(force=force_save)
+    return changed
 
 def load_tasks():
     global TASK_QUEUE
@@ -94,25 +356,36 @@ def load_tasks():
         try:
             content = TASK_QUEUE_FILE.read_text(encoding='utf-8')
             if content:
-                TASK_QUEUE = json.loads(content)
+                with TASK_QUEUE_LOCK:
+                    TASK_QUEUE = json.loads(content)
             
-            # Check for stale running tasks
-            for tid, task in TASK_QUEUE.items():
-                if task.get('status') == 'running':
-                    task['status'] = 'failed'
-                    task['error'] = 'Server restarted while task was running'
-            save_tasks()
+            # Check for stale async tasks left by a previous server process.
+            with TASK_QUEUE_LOCK:
+                for tid, task in TASK_QUEUE.items():
+                    if task.get('status') in ACTIVE_TASK_STATUSES:
+                        task['status'] = 'failed'
+                        task['error'] = 'Server restarted before the asynchronous task completed'
+                    _normalize_task_record(tid, task)
+            save_tasks(force=True)
             logging.info(f"Loaded {len(TASK_QUEUE)} tasks from persistence.")
             
         except Exception as e:
             logging.error(f"Failed to load tasks: {e}")
-            TASK_QUEUE = {}
+            with TASK_QUEUE_LOCK:
+                TASK_QUEUE = {}
 
-def save_tasks():
+def save_tasks(force=False):
+    global _LAST_TASK_SAVE_TS
     try:
+        now = time.monotonic()
+        with TASK_QUEUE_LOCK:
+            if not force and now - _LAST_TASK_SAVE_TS < TASK_SAVE_MIN_INTERVAL_SEC:
+                return
+            payload = _snapshot_tasks_unlocked()
+            _LAST_TASK_SAVE_TS = now
         temp_file = TASK_QUEUE_FILE.with_suffix('.tmp')
         with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(TASK_QUEUE, f, indent=2)
+            f.write(payload)
         temp_file.replace(TASK_QUEUE_FILE)
     except Exception as e:
         logging.error(f"Failed to save tasks: {e}")
@@ -126,61 +399,74 @@ def async_task_wrapper(task_id, func, *args, **kwargs):
     """
     try:
         logging.info(f"Task {task_id} started.")
-        TASK_QUEUE[task_id]['status'] = 'running'
-        save_tasks()
+        set_task_fields(task_id, status='running', message='Running', force_save=True)
         result = func(*args, **kwargs)
-        TASK_QUEUE[task_id]['status'] = 'completed'
-        TASK_QUEUE[task_id]['result'] = result
+        with TASK_QUEUE_LOCK:
+            task = TASK_QUEUE.get(task_id)
+            task_type = task.get('type', 'unknown') if task else 'unknown'
+            task_for_summary = dict(task or {})
+            task_for_summary['id'] = task_id
+        result_ref = _build_result_ref(task_type, result, task_for_summary)
+        result_summary = _summarize_task_result(task_type, result, task_for_summary)
+        fields = {
+            'status': 'completed',
+            'progress': 100,
+            'message': 'Completed',
+            'completed_at': datetime.datetime.now().strftime("%Y%m%d-%H%M%S"),
+            'result_summary': result_summary,
+        }
+        if result_ref:
+            fields['result_ref'] = result_ref
+        set_task_fields(task_id, force_save=True, **fields)
         logging.info(f"Task {task_id} completed successfully.")
     except Exception as e:
         logging.error(f"Task {task_id} failed: {e}", exc_info=True)
-        TASK_QUEUE[task_id]['status'] = 'failed'
-        TASK_QUEUE[task_id]['error'] = str(e)
+        set_task_fields(task_id, status='failed', error=str(e), message='Failed', force_save=True)
     finally:
-        save_tasks()
+        save_tasks(force=True)
+
+
+def has_processed_graphs(dataset_path: Path) -> bool:
+    if not dataset_path.exists():
+        return False
+    graphs_dir = dataset_path / 'graphs'
+    if graphs_dir.exists() and graphs_dir.is_dir():
+        return any(graphs_dir.glob("*.pt"))
+    graphs_pt = dataset_path / 'graphs.pt'
+    return graphs_pt.exists() and graphs_pt.is_file()
 
 @app.route('/api/tasks', methods=['GET'])
 def list_tasks():
     """
     获取所有任务列表 (简略信息)
     """
+    task_type = request.args.get('type')
+    active_only = request.args.get('active_only', '').lower() in {'1', 'true', 'yes'}
+    statuses = {s.strip() for s in request.args.get('status', '').split(',') if s.strip()}
+    limit = request.args.get('limit', type=int)
     tasks_list = []
     # Convert dict to list and sort by creation time (descending)
     # We assume keys are UUIDs. 
     # We need to look at 'created_at' or 'created' field.
     
-    for t_id, t_data in TASK_QUEUE.items():
-        # Basic info
-        task_info = {
-            "id": t_id,
-            "status": t_data.get('status'),
-            "type": t_data.get('type', 'unknown'),
-            "created": t_data.get('created_at', ''),
-            "progress": t_data.get('progress', 0),
-            "message": t_data.get('message', ''),
-            "error": t_data.get('error'),
-            # specific fields
-            "name": t_data.get('dataset_name') or t_data.get('output_name') or f"{t_data.get('type')} task",
-            "files": len(t_data.get('files', [])) if 'files' in t_data else 0
-        }
-        
-        # Enrich for training tasks
-        if t_data.get('type') == 'train':
-            task_info['model'] = t_data.get('config', {}).get('model_type')
-            task_info['dataset'] = t_data.get('config', {}).get('dataset_name')
-            task_info['name'] = f"Train {task_info['model']}"
-            
-        # Enrich for inference tasks
-        if t_data.get('type') == 'inference':
-             task_info['name'] = "Attribution Inference"
-             
-        tasks_list.append(task_info)
+    with TASK_QUEUE_LOCK:
+        task_items = list(TASK_QUEUE.items())
+
+    for t_id, t_data in task_items:
+        status = t_data.get('status')
+        item_type = t_data.get('type', 'unknown')
+        if task_type and item_type != task_type:
+            continue
+        if active_only and status not in ACTIVE_TASK_STATUSES:
+            continue
+        if statuses and status not in statuses:
+            continue
+        tasks_list.append(_task_list_item(t_id, t_data))
         
     # Sort by created time (if available strings)
-    try:
-        tasks_list.sort(key=lambda x: x['created'], reverse=True)
-    except:
-        pass
+    tasks_list.sort(key=lambda x: x['created'], reverse=True)
+    if limit and limit > 0:
+        tasks_list = tasks_list[:limit]
         
     return jsonify(tasks_list)
 
@@ -189,32 +475,42 @@ def get_task_status(task_id):
     """
     查询异步任务的状态。
     """
-    task = TASK_QUEUE.get(task_id)
+    with TASK_QUEUE_LOCK:
+        task = TASK_QUEUE.get(task_id)
+        task = dict(task) if task else None
     if not task:
         return jsonify({"error": "Task not found"}), 404
-    return jsonify(task)
+    return jsonify(_task_detail_payload(task_id, task))
 
 @app.route('/api/tasks/<task_id>', methods=['DELETE'])
 def delete_task(task_id):
     """
     删除任务记录。
     """
-    if task_id in TASK_QUEUE:
-        del TASK_QUEUE[task_id]
-        save_tasks()
+    with TASK_QUEUE_LOCK:
+        existed = task_id in TASK_QUEUE
+        if existed:
+            del TASK_QUEUE[task_id]
+    if existed:
+        save_tasks(force=True)
         return jsonify({"message": "Task deleted successfully"})
-    else:
-        return jsonify({"error": "Task not found"}), 404
+    return jsonify({"error": "Task not found"}), 404
 
 @app.route('/api/raw_datasets', methods=['GET'])
 def list_raw_datasets():
     """
     列出所有未处理的原始数据集 (dataset_TXT 下的子目录).
     """
-    datasets = []
     # Primary root is dataset_TXT
     root = BASE_DIR / 'dataset_TXT'
-    
+
+    cache_key = "raw_datasets"
+    signature = _dir_signature(root)
+    cached = _dir_cache_get(cache_key, signature)
+    if cached is not None:
+        return jsonify(cached)
+
+    datasets = []
     if root.exists() and root.is_dir():
         for item in root.iterdir():
             if item.is_dir():
@@ -223,7 +519,7 @@ def list_raw_datasets():
                 # Simple heuristic: scan for pdf/txt
                 for ext in ['*.pdf', '*.txt', '*.json']:
                     file_count += len(list(item.rglob(ext)))
-                
+
                 datasets.append({
                     "id": item.name,
                     "name": item.name,
@@ -231,7 +527,8 @@ def list_raw_datasets():
                     "file_count": file_count,
                     "type": "FileSystem"
                 })
-            
+
+    _dir_cache_set(cache_key, signature, datasets)
     return jsonify(datasets)
 
 @app.route('/api/raw_datasets/files', methods=['GET'])
@@ -247,7 +544,13 @@ def list_raw_dataset_files():
     path = Path(path_str)
     if not path.exists() or not path.is_dir():
         return jsonify({"error": "Path not found"}), 404
-        
+
+    cache_key = f"raw_files:{path}"
+    signature = _dir_signature(path)
+    cached = _dir_cache_get(cache_key, signature)
+    if cached is not None:
+        return jsonify(cached)
+
     files = []
     # Limit to first 1000 files to avoid payload explosion
     count = 0
@@ -262,8 +565,10 @@ def list_raw_dataset_files():
             count += 1
             if count >= 1000:
                 break
-                
-    return jsonify({"files": files, "total_shown": count})
+
+    payload = {"files": files, "total_shown": count}
+    _dir_cache_set(cache_key, signature, payload)
+    return jsonify(payload)
 
 @app.route('/api/raw_datasets', methods=['POST'])
 def create_raw_dataset():
@@ -492,13 +797,16 @@ def preprocess_data():
         output_dir = PROCESSED_DATA_DIR / dir_name
         output_dir.mkdir(exist_ok=True)
         
-        TASK_QUEUE[task_id] = {
-            'status': 'pending',
-            'created_at': timestamp,
-            'type': 'preprocess',
-            'source': str(path)
-        }
-        save_tasks()
+        with TASK_QUEUE_LOCK:
+            TASK_QUEUE[task_id] = {
+                'status': 'pending',
+                'created_at': timestamp,
+                'type': 'preprocess',
+                'source': str(path),
+                'output_name': output_name or dir_name,
+                'output_dir': str(output_dir),
+            }
+        save_tasks(force=True)
         
         def preprocess_worker_local():
             def progress_cb(current, total, msg):
@@ -519,9 +827,7 @@ def preprocess_data():
                 elif msg.startswith("Done"):
                     pct = 100
 
-                TASK_QUEUE[task_id]['progress'] = pct
-                TASK_QUEUE[task_id]['message'] = msg
-                save_tasks()
+                set_task_fields(task_id, progress=pct, message=msg)
 
             result_path = run_preprocessing_pipeline(
                 raw_data_dir=path,
@@ -585,13 +891,17 @@ def preprocess_data():
         output_dir = PROCESSED_DATA_DIR / dir_name
         output_dir.mkdir(exist_ok=True)
 
-        TASK_QUEUE[task_id] = {
-            'status': 'pending',
-            'created_at': timestamp,
-            'type': 'preprocess',
-            'source': 'upload'
-        }
-        save_tasks()
+        with TASK_QUEUE_LOCK:
+            TASK_QUEUE[task_id] = {
+                'status': 'pending',
+                'created_at': timestamp,
+                'type': 'preprocess',
+                'source': 'upload',
+                'output_name': output_name or dir_name,
+                'output_dir': str(output_dir),
+                'file_count': len(saved_files),
+            }
+        save_tasks(force=True)
 
         # 定义实际执行的函数
         def preprocess_worker():
@@ -612,9 +922,7 @@ def preprocess_data():
                     elif msg.startswith("Done"):
                         pct = 100
 
-                    TASK_QUEUE[task_id]['progress'] = pct
-                    TASK_QUEUE[task_id]['message'] = msg
-                    save_tasks()
+                    set_task_fields(task_id, progress=pct, message=msg)
 
                 result_path = run_preprocessing_pipeline(
                     raw_data_dir=temp_upload_dir,
@@ -647,13 +955,36 @@ def preprocess_data():
         logging.error(f"An error occurred during upload handling: {e}", exc_info=True)
         return jsonify({"error": "An internal error occurred", "details": str(e)}), 500
 
+def _datasets_signature() -> tuple:
+    """Signature covering the dataset roots and the stats files inside each."""
+    sig = [_dir_signature(PROCESSED_DATA_DIR)]
+    if PROCESSED_DATA_DIR.exists():
+        for run_dir in sorted(PROCESSED_DATA_DIR.iterdir()):
+            if run_dir.is_dir():
+                for probe in (run_dir / "graph_stats.json", run_dir / "graphs", run_dir / "metadata.json"):
+                    try:
+                        st_ = probe.stat()
+                        sig.append((probe.name, run_dir.name, st_.st_mtime))
+                    except OSError:
+                        continue
+    return tuple(sig)
+
+
 @app.route('/api/datasets', methods=['GET'])
 def list_datasets():
     """
     列出所有已处理的数据集 (Grouped by preprocessing run)。
     """
+    include_raw_stats = request.args.get('include_raw_stats', '').lower() in {'1', 'true', 'yes'}
+
+    cache_key = f"datasets:{include_raw_stats}"
+    signature = _datasets_signature()
+    cached = _dir_cache_get(cache_key, signature)
+    if cached is not None:
+        return jsonify(cached)
+
     datasets = []
-    
+
     if PROCESSED_DATA_DIR.exists():
         for run_dir in PROCESSED_DATA_DIR.iterdir():
             if run_dir.is_dir():
@@ -719,8 +1050,9 @@ def list_datasets():
                                     "total_nodes": total_nodes,
                                     "total_edges": total_edges,
                                     "apt_groups": apt_groups,
-                                    "raw_stats": stats_data
                                 }
+                                if include_raw_stats:
+                                    dataset_info["stats"]["raw_stats"] = stats_data
                         except Exception as e:
                             logging.warning(f"Failed to load stats for {run_dir}: {e}")
                             
@@ -728,6 +1060,7 @@ def list_datasets():
     
     # Sort by created desc
     datasets.sort(key=lambda x: x['created'], reverse=True)
+    _dir_cache_set(cache_key, signature, datasets)
     return jsonify(datasets)
 
 @app.route('/api/datasets/<dataset_id>', methods=['DELETE'])
@@ -793,16 +1126,11 @@ def list_graphs_in_dataset(dataset_id):
     stats_map = {}
     stats_file = target_dir / "graph_stats.json"
     if stats_file.exists():
-        try:
-            with open(stats_file, 'r', encoding='utf-8') as f:
-                stats_list = json.load(f)
-                # Assuming order matches or we need a key. 
-                # In preprocess.py, we don't save filename in stats explicitly but report_id is there.
-                # Let's map report_id -> stat
-                for s in stats_list:
-                    stats_map[s.get('report_id')] = s
-        except:
-            pass
+        stats_list = _read_json_cached(stats_file)
+        if isinstance(stats_list, list):
+            # report_id -> stat (report_id is recorded per graph in preprocess.py)
+            for s in stats_list:
+                stats_map[s.get('report_id')] = s
 
     # List all .pt files (or whatever graph format)
     # Actually, in preprocess.py, we save ALL graphs into a single `graphs.pt` file usually for PyG.
@@ -830,18 +1158,14 @@ def list_graphs_in_dataset(dataset_id):
     # This requires loading torch, which is heavy for an API endpoint if not careful.
     # But it is the only way to support "real" deletion inside a .pt list.
     
-    if not stats_map and stats_file.exists():
-         # Reload if we failed above or just use the list
-         try:
-            with open(stats_file, 'r', encoding='utf-8') as f:
-                stats_list = json.load(f)
-                return jsonify(stats_list)
-         except Exception as e:
-             return jsonify({"error": str(e)}), 500
-             
     if stats_map:
         return jsonify(list(stats_map.values()))
-        
+
+    if stats_file.exists():
+        data = _read_json_cached(stats_file)
+        if isinstance(data, list):
+            return jsonify(data)
+
     return jsonify([])
 
 @app.route('/api/datasets/<dataset_id>/graphs/<report_id>', methods=['DELETE'])
@@ -951,14 +1275,13 @@ def get_dataset_stats(dataset_id):
     """获取数据集的统计信息"""
     target_dir = PROCESSED_DATA_DIR / dataset_id
     stats_file = target_dir / "graph_stats.json"
-    
+
     if stats_file.exists():
-        try:
-            with open(stats_file, 'r', encoding='utf-8') as f:
-                return jsonify(json.load(f))
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    
+        data = _read_json_cached(stats_file)
+        if data is None:
+            return jsonify({"error": "Failed to read stats"}), 500
+        return jsonify(data)
+
     return jsonify({"error": "Stats not found"}), 404
 
 @app.route('/api/models', methods=['GET'])
@@ -966,6 +1289,7 @@ def list_models():
     """
     列出所有已训练的模型。
     """
+    include_report = request.args.get('include_report', '').lower() in {'1', 'true', 'yes'}
     models = []
     if TRAINING_RUNS_DIR.exists():
         for run_dir in TRAINING_RUNS_DIR.iterdir():
@@ -982,7 +1306,7 @@ def list_models():
                         if not model_name:
                              model_name = f"{results.get('config', {}).get('model_type', 'Unknown')}_{run_dir.name}"
 
-                        models.append({
+                        model_info = {
                             "id": run_dir.name,
                             "name": model_name,
                             "type": results.get('config', {}).get('model_type', 'GNN'),
@@ -991,17 +1315,56 @@ def list_models():
                             "accuracy": results.get('test_accuracy', 0.0),
                             "f1_score": results.get('test_f1_weighted', 0.0),
                             "epochs": results.get('config', {}).get('epochs', 0),
+                            "batch_size": results.get('config', {}).get('batch_size', 32),
                             "created": datetime.datetime.fromtimestamp(run_dir.stat().st_ctime).strftime('%Y-%m-%d %H:%M:%S'),
                             "status": "Completed",
-                            "classification_report": results.get('classification_report', {}),
                             "path": str(run_dir)
-                        })
+                        }
+                        if include_report:
+                            model_info["classification_report"] = results.get('classification_report', {})
+                        models.append(model_info)
                     except Exception as e:
                         logging.warning(f"Failed to parse results for {run_dir}: {e}")
     
     # 按创建时间倒序
     models.sort(key=lambda x: x['created'], reverse=True)
     return jsonify(models)
+
+@app.route('/api/models/<model_id>', methods=['GET'])
+def get_model_detail(model_id):
+    target_dir = TRAINING_RUNS_DIR / model_id
+    if not target_dir.exists() or not target_dir.is_dir():
+        return jsonify({"error": "Model not found"}), 404
+
+    results_file = target_dir / 'results.json'
+    if not results_file.exists():
+        return jsonify({"error": "Results file not found"}), 404
+
+    try:
+        with open(results_file, 'r', encoding='utf-8') as f:
+            results = json.load(f)
+
+        model_name = results.get('custom_name')
+        if not model_name:
+            model_name = f"{results.get('config', {}).get('model_type', 'Unknown')}_{target_dir.name}"
+
+        return jsonify({
+            "id": target_dir.name,
+            "name": model_name,
+            "type": results.get('config', {}).get('model_type', 'GNN'),
+            "dataset_id": results.get('config', {}).get('dataset_id', 'Unknown'),
+            "dataset_name": results.get('config', {}).get('dataset_name', 'Unknown'),
+            "accuracy": results.get('test_accuracy', 0.0),
+            "f1_score": results.get('test_f1_weighted', 0.0),
+            "epochs": results.get('config', {}).get('epochs', 0),
+            "batch_size": results.get('config', {}).get('batch_size', 32),
+            "created": datetime.datetime.fromtimestamp(target_dir.stat().st_ctime).strftime('%Y-%m-%d %H:%M:%S'),
+            "status": "Completed",
+            "classification_report": results.get('classification_report', {}),
+            "path": str(target_dir)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/models/<model_id>/rename', methods=['PUT'])
 def rename_model(model_id):
@@ -1062,6 +1425,16 @@ def train_model_api():
     processed_data_path = config.get('processed_data_path')
     if not processed_data_path or not Path(processed_data_path).exists():
         return jsonify({"error": f"Processed data path is missing or does not exist: {processed_data_path}"}), 400
+    if not has_processed_graphs(Path(processed_data_path)):
+        return jsonify({"error": f"Processed dataset is empty or graph construction has not completed yet: {processed_data_path}"}), 400
+
+    try:
+        batch_size = int(config.get('batch_size', 32))
+    except (TypeError, ValueError):
+        return jsonify({"error": "batch_size must be an integer"}), 400
+    if batch_size < 1:
+        return jsonify({"error": "batch_size must be greater than 0"}), 400
+    config['batch_size'] = batch_size
 
     # 将主输出目录注入配置中
     config['base_output_dir'] = str(TRAINING_RUNS_DIR)
@@ -1070,13 +1443,15 @@ def train_model_api():
     task_id = str(uuid.uuid4())
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     
-    TASK_QUEUE[task_id] = {
-        'status': 'pending',
-        'created_at': timestamp,
-        'type': 'train',
-        'config': config
-    }
-    save_tasks()
+    with TASK_QUEUE_LOCK:
+        TASK_QUEUE[task_id] = {
+            'status': 'pending',
+            'created_at': timestamp,
+            'type': 'train',
+            'config': config,
+            'output_name': f"train_{config.get('model_type', 'model')}_{timestamp}",
+        }
+    save_tasks(force=True)
 
     # 启动线程
     thread = threading.Thread(target=async_task_wrapper, args=(task_id, run_training_pipeline, config))
@@ -1110,18 +1485,22 @@ def run_inference_api():
         return jsonify({"error": "Model not found"}), 404
     if not dataset_dir.exists():
         return jsonify({"error": "Dataset not found"}), 404
+    if not has_processed_graphs(dataset_dir):
+        return jsonify({"error": "Dataset is empty or preprocessing has not completed yet"}), 400
 
     task_id = str(uuid.uuid4())
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = ATTRIBUTION_RESULTS_DIR / f"{timestamp}_{task_id}"
 
-    TASK_QUEUE[task_id] = {
-        'status': 'pending',
-        'created_at': timestamp,
-        'type': 'inference',
-        'config': config
-    }
-    save_tasks()
+    with TASK_QUEUE_LOCK:
+        TASK_QUEUE[task_id] = {
+            'status': 'pending',
+            'created_at': timestamp,
+            'type': 'inference',
+            'config': config,
+            'output_dir': str(output_dir),
+        }
+    save_tasks(force=True)
 
     def inference_worker():
         return run_inference_pipeline(
@@ -1139,55 +1518,192 @@ def run_inference_api():
         "status_url": f"/api/tasks/{task_id}"
     }), 202
 
+# Per-sample heavy fields the UI never consumes in the history view. Dropping
+# them shrinks an inference payload by well over half (a single results file can
+# be hundreds of MB; graph/attention blobs dominate it).
+_HEAVY_SAMPLE_FIELDS = ("graph_data", "attention_data")
+
+
+def _result_created_from_dirname(name: str) -> tuple[str, str]:
+    parts = name.split('_')
+    ts = parts[0]
+    tid = parts[1] if len(parts) > 1 else "unknown"
+    try:
+        created = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+    except Exception:
+        created = ts
+    return tid, created
+
+
+def _ensure_result_summary(res_dir: Path) -> dict | None:
+    """Return a small summary for a result dir, building a sidecar once.
+
+    The full ``inference_results.json`` can be hundreds of MB, so we never read
+    it just to list results. We persist a tiny ``summary.json`` next to it and
+    reuse that on every later call. The sidecar is rebuilt if it is older than
+    the source file.
+    """
+    res_file = res_dir / "inference_results.json"
+    if not res_file.exists():
+        return None
+
+    summary_file = res_dir / "summary.json"
+    try:
+        if summary_file.exists() and summary_file.stat().st_mtime >= res_file.stat().st_mtime:
+            cached = _read_json_cached(summary_file)
+            if isinstance(cached, dict):
+                return cached
+    except OSError:
+        pass
+
+    # Build the sidecar from the heavy source once.
+    data = _read_json_file(res_file)
+    if not isinstance(data, dict):
+        return None
+    tid, created = _result_created_from_dirname(res_dir.name)
+    summary = {
+        "id": res_dir.name,
+        "task_id": tid,
+        "created": created,
+        "total_samples": data.get("total_samples", 0),
+        "label_distribution": data.get("label_distribution", {}),
+        "path": str(res_dir),
+    }
+    try:
+        tmp = summary_file.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False)
+        tmp.replace(summary_file)
+    except Exception as exc:
+        logging.warning("Failed to write summary sidecar for %s: %s", res_dir, exc)
+    return summary
+
+
 @app.route('/api/attribution_results', methods=['GET'])
 def list_attribution_results():
-    """
-    List past attribution results.
-    """
+    """List past attribution results (lightweight summaries only)."""
+    if not ATTRIBUTION_RESULTS_DIR.exists():
+        return jsonify([])
+
+    signature = _dir_signature(ATTRIBUTION_RESULTS_DIR)
+    cached = _dir_cache_get("attribution_results", signature)
+    if cached is not None:
+        return jsonify(cached)
+
     results = []
-    if ATTRIBUTION_RESULTS_DIR.exists():
-        for res_dir in ATTRIBUTION_RESULTS_DIR.iterdir():
-            if res_dir.is_dir():
-                res_file = res_dir / "inference_results.json"
-                if res_file.exists():
-                    try:
-                        with open(res_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            # Add metadata from directory name
-                            parts = res_dir.name.split('_')
-                            ts = parts[0]
-                            tid = parts[1] if len(parts) > 1 else "unknown"
-                            
-                            results.append({
-                                "id": res_dir.name,
-                                "task_id": tid,
-                                "created": f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}",
-                                "total_samples": data.get("total_samples", 0),
-                                "label_distribution": data.get("label_distribution", {}),
-                                "path": str(res_dir)
-                            })
-                    except Exception as e:
-                        logging.warning(f"Failed to load result {res_dir}: {e}")
-    
+    for res_dir in ATTRIBUTION_RESULTS_DIR.iterdir():
+        if res_dir.is_dir():
+            summary = _ensure_result_summary(res_dir)
+            if summary:
+                results.append(summary)
+
     results.sort(key=lambda x: x['created'], reverse=True)
+    _dir_cache_set("attribution_results", signature, results)
     return jsonify(results)
+
 
 @app.route('/api/attribution_results/<result_id>', methods=['GET'])
 def get_attribution_result_detail(result_id):
-    """
-    Get detailed attribution result.
+    """Detail without the heavy per-sample graph/attention blobs.
+
+    Returns distribution + per-sample table fields + explanation, but strips
+    ``graph_data``/``attention_data`` so the payload is small enough to cache
+    and ship quickly. Pass ``?full=1`` to get the untouched file.
     """
     target_dir = ATTRIBUTION_RESULTS_DIR / result_id
     res_file = target_dir / "inference_results.json"
-    
     if not res_file.exists():
         return jsonify({"error": "Result not found"}), 404
-        
+
+    want_full = request.args.get('full', '').lower() in {'1', 'true', 'yes'}
+    if want_full:
+        data = _read_json_file(res_file)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Failed to read result"}), 500
+        return jsonify(data)
+
+    # Serve a cached slim sidecar (table fields + distribution, no explanation /
+    # graph / attention) so repeat views never re-read the huge source file.
+    slim_file = target_dir / "detail_slim.json"
     try:
-        with open(res_file, 'r', encoding='utf-8') as f:
-            return jsonify(json.load(f))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        if slim_file.exists() and slim_file.stat().st_mtime >= res_file.stat().st_mtime:
+            cached = _read_json_cached(slim_file)
+            if isinstance(cached, dict):
+                return jsonify(cached)
+    except OSError:
+        pass
+
+    data = _read_json_file(res_file)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Failed to read result"}), 500
+
+    slim = {
+        "total_samples": data.get("total_samples", 0),
+        "label_distribution": data.get("label_distribution", {}),
+        "output_dir": data.get("output_dir"),
+        "results": [
+            {
+                "report_id": s.get("report_id"),
+                "predicted_label": s.get("predicted_label"),
+                "confidence": s.get("confidence"),
+                "top3": s.get("top3"),
+            }
+            for s in data.get("results", [])
+        ],
+    }
+    try:
+        tmp = slim_file.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(slim, f, ensure_ascii=False)
+        tmp.replace(slim_file)
+    except Exception as exc:
+        logging.warning("Failed to write slim detail for %s: %s", target_dir, exc)
+    return jsonify(slim)
+
+
+@app.route('/api/attribution_results/<result_id>/sample/<report_id>', methods=['GET'])
+def get_attribution_sample(result_id, report_id):
+    """Return a single sample's explanation, loaded on demand.
+
+    Backed by a one-time ``explanations.json`` sidecar (all samples minus the
+    heavy graph/attention blobs), so after the first build every sample lookup
+    is a small cached read instead of re-parsing the multi-hundred-MB source.
+    """
+    target_dir = ATTRIBUTION_RESULTS_DIR / result_id
+    res_file = target_dir / "inference_results.json"
+    if not res_file.exists():
+        return jsonify({"error": "Result not found"}), 404
+
+    expl_file = target_dir / "explanations.json"
+    index = None
+    try:
+        if expl_file.exists() and expl_file.stat().st_mtime >= res_file.stat().st_mtime:
+            cached = _read_json_cached(expl_file)
+            if isinstance(cached, dict):
+                index = cached
+    except OSError:
+        pass
+
+    if index is None:
+        data = _read_json_file(res_file)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Failed to read result"}), 500
+        index = {
+            str(s.get("report_id")): {k: v for k, v in s.items() if k not in _HEAVY_SAMPLE_FIELDS}
+            for s in data.get("results", [])
+        }
+        try:
+            tmp = expl_file.with_suffix('.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(index, f, ensure_ascii=False)
+            tmp.replace(expl_file)
+        except Exception as exc:
+            logging.warning("Failed to write explanations sidecar for %s: %s", target_dir, exc)
+
+    sample = index.get(str(report_id))
+    if sample is None:
+        return jsonify({"error": "Sample not found"}), 404
+    return jsonify(sample)
 
 @app.route('/api/attribution_results/<result_id>', methods=['DELETE'])
 def delete_attribution_result(result_id):
@@ -1225,15 +1741,10 @@ def generate_report():
         # Attribution result IDs are timestamps + task_ids usually, or just task_ids if we map them.
         # But frontend might pass a task_id from TASK_QUEUE.
         
-        task = TASK_QUEUE.get(task_id)
+        with TASK_QUEUE_LOCK:
+            task = TASK_QUEUE.get(task_id)
         if task and task.get('type') == 'inference' and task.get('status') == 'completed':
-             # Load inference results
-             # The result field in task might contain the path or summary
-             # Inference pipeline returns dict with 'total_samples', 'label_distribution', 'results'
-             # Or it saves to file.
-             
-             # Let's check run_inference_pipeline return value. It returns dict.
-             inf_res = task.get('result', {})
+             inf_res = _load_task_result(task) or {}
              
              # Convert to report format
              # Top attribution is the one with highest count in label_distribution? 
@@ -1260,6 +1771,10 @@ def generate_report():
                  analysis_results['total_samples'] = total
 
     result_dir = ATTRIBUTION_RESULTS_DIR / task_id
+    if not result_dir.exists():
+        found_dir = _find_inference_result_dir(str(task_id))
+        if found_dir:
+            result_dir = found_dir
     result_file = result_dir / "inference_results.json"
     if result_file.exists():
         with open(result_file, 'r', encoding='utf-8') as f:

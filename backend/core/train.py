@@ -11,8 +11,10 @@ import sys
 import io
 import copy
 import hashlib
+import math
 import re
 from collections import defaultdict
+from contextlib import nullcontext
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
@@ -45,7 +47,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import Sampler, WeightedRandomSampler
 from torch_geometric.nn import GATConv, GCNConv, TransformerConv, SAGEConv, GINConv, global_mean_pool, global_max_pool
 from torch_geometric.nn.aggr import AttentionalAggregation
 from torch_geometric.utils import dropout_adj
@@ -411,6 +413,117 @@ def _normalize_graph_dict_metadata_for_batch(graphs: List[Data]) -> None:
                 for key in ordered_keys
             }
             setattr(graph, attr_name, normalized)
+
+
+def _graph_num_nodes(graph: Data) -> int:
+    if getattr(graph, "x", None) is not None:
+        return int(graph.x.size(0))
+    if getattr(graph, "num_nodes", None) is not None:
+        return int(graph.num_nodes)
+    return 0
+
+
+def _graph_num_edges(graph: Data) -> int:
+    if getattr(graph, "edge_index", None) is not None:
+        return int(graph.edge_index.size(1))
+    return 0
+
+
+class GraphBudgetBatchSampler(Sampler[List[int]]):
+    """Batch graphs by count plus node/edge budgets to stabilize peak VRAM."""
+
+    def __init__(
+        self,
+        graphs: List[Data],
+        *,
+        max_graphs: int,
+        max_nodes_per_batch: int = 0,
+        max_edges_per_batch: int = 0,
+        shuffle: bool = False,
+    ) -> None:
+        self.graphs = graphs
+        self.max_graphs = max(1, int(max_graphs))
+        self.max_nodes_per_batch = max(0, int(max_nodes_per_batch))
+        self.max_edges_per_batch = max(0, int(max_edges_per_batch))
+        self.shuffle = bool(shuffle)
+        self._length_hint = self._estimate_length()
+
+    def _would_exceed_budget(self, graph_idx: int, batch: List[int], total_nodes: int, total_edges: int) -> bool:
+        if not batch:
+            return False
+        next_nodes = total_nodes + _graph_num_nodes(self.graphs[graph_idx])
+        next_edges = total_edges + _graph_num_edges(self.graphs[graph_idx])
+        if len(batch) >= self.max_graphs:
+            return True
+        if self.max_nodes_per_batch > 0 and next_nodes > self.max_nodes_per_batch:
+            return True
+        if self.max_edges_per_batch > 0 and next_edges > self.max_edges_per_batch:
+            return True
+        return False
+
+    def _estimate_length(self) -> int:
+        if not self.graphs:
+            return 0
+        batches = 0
+        batch: List[int] = []
+        total_nodes = 0
+        total_edges = 0
+        for graph_idx in range(len(self.graphs)):
+            if self._would_exceed_budget(graph_idx, batch, total_nodes, total_edges):
+                batches += 1
+                batch = []
+                total_nodes = 0
+                total_edges = 0
+            batch.append(graph_idx)
+            total_nodes += _graph_num_nodes(self.graphs[graph_idx])
+            total_edges += _graph_num_edges(self.graphs[graph_idx])
+            if (
+                len(batch) >= self.max_graphs
+                or (self.max_nodes_per_batch > 0 and total_nodes >= self.max_nodes_per_batch)
+                or (self.max_edges_per_batch > 0 and total_edges >= self.max_edges_per_batch)
+            ):
+                batches += 1
+                batch = []
+                total_nodes = 0
+                total_edges = 0
+        if batch:
+            batches += 1
+        return batches
+
+    def __iter__(self):
+        indices = list(range(len(self.graphs)))
+        if self.shuffle:
+            random.shuffle(indices)
+
+        batch: List[int] = []
+        total_nodes = 0
+        total_edges = 0
+        for graph_idx in indices:
+            if self._would_exceed_budget(graph_idx, batch, total_nodes, total_edges):
+                yield batch
+                batch = []
+                total_nodes = 0
+                total_edges = 0
+
+            batch.append(graph_idx)
+            total_nodes += _graph_num_nodes(self.graphs[graph_idx])
+            total_edges += _graph_num_edges(self.graphs[graph_idx])
+
+            if (
+                len(batch) >= self.max_graphs
+                or (self.max_nodes_per_batch > 0 and total_nodes >= self.max_nodes_per_batch)
+                or (self.max_edges_per_batch > 0 and total_edges >= self.max_edges_per_batch)
+            ):
+                yield batch
+                batch = []
+                total_nodes = 0
+                total_edges = 0
+
+        if batch:
+            yield batch
+
+    def __len__(self) -> int:
+        return self._length_hint
 
 
 def load_graph_dataset(dataset_path: Path, label_mapping_path: Optional[Path] = None) -> tuple[List[Data], Dict[str, int], Dict[int, str]]:
@@ -1396,49 +1509,66 @@ def _graph_structure_summary(graphs: List[Data]) -> Dict[str, Any]:
     }
 
 
-def train_epoch(model, train_loader, optimizer, criterion, device, scaler=None, clip_norm: float = 0.0):
+def _autocast_context(device: torch.device, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        return torch.amp.autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=True)
+    return autocast(enabled=True)
+
+
+def train_epoch(
+    model,
+    train_loader,
+    optimizer,
+    criterion,
+    device,
+    scaler=None,
+    clip_norm: float = 0.0,
+    gradient_accumulation_steps: int = 1,
+    use_amp: bool = True,
+):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
-    
-    for batch in train_loader:
+    accumulation_steps = max(1, int(gradient_accumulation_steps))
+    optimizer.zero_grad(set_to_none=True)
+
+    for step_idx, batch in enumerate(train_loader, start=1):
         batch = batch.to(device)
-        optimizer.zero_grad()
-        
         doc_emb = None
         if hasattr(batch, 'doc_emb'):
             doc_emb = batch.doc_emb
 
-        # Use torch.amp.autocast for newer PyTorch versions to avoid warnings
-        if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
-            device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-            # Only enable if on CUDA for now (unless using bfloat16 on CPU which requires more setup)
-            amp_ctx = torch.amp.autocast(device_type=device_type, enabled=(device.type == 'cuda'))
-        else:
-            amp_ctx = autocast(enabled=(device.type == 'cuda'))
-
-        with amp_ctx:
+        with _autocast_context(device, enabled=(use_amp and device.type == 'cuda')):
             if isinstance(model, APTAttributionGraphSAGE):
                 out = model(batch.x, batch.edge_index, batch.batch, doc_emb=doc_emb)
             else:
                 out = model(batch.x, batch.edge_index, batch.batch)
 
             loss = criterion(out, batch.y)
-        
+
+        step_loss = loss / accumulation_steps
         if scaler is not None:
-            scaler.scale(loss).backward()
-            if clip_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(step_loss).backward()
         else:
-            loss.backward()
-            if clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-            optimizer.step()
-        
+            step_loss.backward()
+
+        should_step = (step_idx % accumulation_steps == 0) or (step_idx == len(train_loader))
+        if should_step:
+            if scaler is not None:
+                if clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
         total_loss += loss.item()
         pred = out.argmax(dim=1)
         correct += (pred == batch.y).sum().item()
@@ -1461,11 +1591,12 @@ def validate(model, val_loader, criterion, device):
             doc_emb = None
             if hasattr(batch, 'doc_emb'):
                 doc_emb = batch.doc_emb
-            
-            if isinstance(model, APTAttributionGraphSAGE):
-                out = model(batch.x, batch.edge_index, batch.batch, doc_emb=doc_emb)
-            else:
-                out = model(batch.x, batch.edge_index, batch.batch)
+
+            with _autocast_context(device, enabled=(device.type == 'cuda')):
+                if isinstance(model, APTAttributionGraphSAGE):
+                    out = model(batch.x, batch.edge_index, batch.batch, doc_emb=doc_emb)
+                else:
+                    out = model(batch.x, batch.edge_index, batch.batch)
 
             loss = criterion(out, batch.y)
             total_loss += loss.item()
@@ -1511,7 +1642,8 @@ def _collect_logits_and_labels(model, loader, device: torch.device) -> tuple[tor
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            logits.append(_forward_model(model, batch).detach().cpu())
+            with _autocast_context(device, enabled=(device.type == 'cuda')):
+                logits.append(_forward_model(model, batch).detach().float().cpu())
             labels.append(batch.y.detach().cpu())
     if not logits:
         return torch.empty((0, 0), dtype=torch.float), torch.empty((0,), dtype=torch.long)
@@ -1739,26 +1871,67 @@ def _resolve_dataloader_workers(config: Dict[str, Any]) -> int:
         return 4 if os.name != "nt" else 0
     return 0
 
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "cuda out of memory" in str(exc).lower()
+
+
+def _release_cuda_memory() -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def _resolve_graph_batch_budget(
+    config: Dict[str, Any],
+    graphs: List[Data],
+    batch_size: int,
+    key: str,
+    stat_getter,
+    multiplier: float,
+) -> int:
+    configured = int(config.get(key, 0) or 0)
+    if configured > 0:
+        return configured
+    if not graphs:
+        return 0
+    stats = [stat_getter(graph) for graph in graphs if stat_getter(graph) > 0]
+    if not stats:
+        return 0
+    median_value = int(np.median(np.asarray(stats, dtype=np.float64)))
+    return max(median_value, int(math.ceil(median_value * max(1, batch_size) * multiplier)))
+
 def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Orchestrates the model training and evaluation process based on a config dict.
-    """
+    """Orchestrate model training, evaluation, and artifact writing."""
     base_output_dir = Path(config.get('base_output_dir', 'results_archive/training_runs'))
     processed_data_path = Path(config.get('processed_data_path'))
-    
-    # Try to find label mapping
-    # Priority 1: Inside the dataset directory (Standard)
+
     label_mapping_path = processed_data_path / "label_mapping.json"
-    
-    # Priority 2: Parent directory (Legacy or shared)
     if not label_mapping_path.exists():
         label_mapping_path = processed_data_path.parent / "label_mapping.json"
-    
+
     if not label_mapping_path.exists():
-        LOGGER.warning(f"Label mapping file not found at {label_mapping_path}. This may cause label mismatch errors.")
+        LOGGER.warning("Label mapping file not found at %s. This may cause label mismatch errors.", label_mapping_path)
         label_mapping_path = None
     else:
-        LOGGER.info(f"Using label mapping from: {label_mapping_path}")
+        LOGGER.info("Using label mapping from: %s", label_mapping_path)
     raw_index_path = processed_data_path / "raw_index.csv"
 
     model_type = config.get('model_type', 'GAT')
@@ -1771,7 +1944,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     rgcn_num_bases = config.get('rgcn_num_bases', 30)
     raw_loss_type = config.get('loss_type', None)
     if raw_loss_type is None:
-        raw_loss_type = 'focal' if model_type == "RGAT" else 'cross_entropy'
+        raw_loss_type = 'focal' if model_type == 'RGAT' else 'cross_entropy'
     loss_type = str(raw_loss_type).strip().lower()
     focal_gamma = float(config.get('focal_gamma', 2.0))
     use_temperature_calibration = bool(config.get('use_temperature_calibration', True))
@@ -1782,70 +1955,70 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     epochs = int(config.get('epochs', 100))
     lr = float(config.get('lr', 0.001))
     batch_size = int(config.get('batch_size', 32))
+    hidden_dim = int(config.get('hidden_dim', 128))
+    dropout = float(config.get('dropout', 0.5))
+    clip_norm = float(config.get('clip_norm', 0.0) or 0.0)
+    gradient_accumulation_steps = max(1, int(config.get('gradient_accumulation_steps', 1) or 1))
+    auto_scale_accumulation = bool(config.get('auto_scale_accumulation', True))
+    mixed_precision = bool(config.get('mixed_precision', True))
+    dynamic_batch_by_graph_size = bool(config.get('dynamic_batch_by_graph_size', True))
     seed = int(config.get('seed', 42))
     gpu_id = int(config.get('gpu_id', -1))
     dataset_id = str(config.get('dataset_id', config.get('dataset_name', 'unknown')))
     require_cuda = bool(config.get('require_cuda', True))
+    auto_shrink_batch_size = bool(config.get('auto_shrink_batch_size', True))
+    min_batch_size = max(1, int(config.get('min_batch_size', 1) or 1))
+    max_nodes_per_batch = int(config.get('max_nodes_per_batch', 0) or 0)
+    max_edges_per_batch = int(config.get('max_edges_per_batch', 0) or 0)
 
-    if strict_repro and model_type == "HGT":
-        raise ValueError("HGT in this repository is an HGT-inspired approximation over homogeneous graphs. Use --allow-approximate to run it.")
+    if strict_repro and model_type == 'HGT':
+        raise ValueError('HGT in this repository is an HGT-inspired approximation over homogeneous graphs. Use --allow-approximate to run it.')
 
     if require_cuda and not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is required for this experiment, but PyTorch cannot access a GPU in the current runtime."
-        )
+        raise RuntimeError('CUDA is required for this experiment, but PyTorch cannot access a GPU in the current runtime.')
 
-    # Honor explicit gpu_id (the runner sets CUDA_VISIBLE_DEVICES so cuda:0 is the right card)
     if gpu_id >= 0 and torch.cuda.is_available():
         try:
             torch.cuda.set_device(0)
         except Exception:
             pass
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    # 若调用方提供了 run_dir，则直接用（便于实验 runner 控制目录）
+    timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     if config.get('run_dir'):
         run_output_dir = Path(config['run_dir'])
     else:
-        run_output_dir = base_output_dir / f"{model_type}_{timestamp}_seed{seed}"
+        run_output_dir = base_output_dir / f'{model_type}_{timestamp}_seed{seed}'
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
     if torch.cuda.is_available():
-        LOGGER.info("CUDA is available. Using GPU for training.")
-        LOGGER.info(f"GPU Device: {torch.cuda.get_device_name(0)}")
+        LOGGER.info('CUDA is available. Using GPU for training.')
+        LOGGER.info('GPU Device: %s', torch.cuda.get_device_name(0))
     else:
-        LOGGER.warning("CUDA is not available. Using CPU for training. This may be slow.")
+        LOGGER.warning('CUDA is not available. Using CPU for training. This may be slow.')
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     reset_vram_peak()
 
-    # TimeLogger: 实验全过程时间与资源采集
     time_logger = TimeLogger(
-        experiment_id=f"{model_type}_{dataset_id}_seed{seed}",
+        experiment_id=f'{model_type}_{dataset_id}_seed{seed}',
         dataset=dataset_id,
         model=model_type,
         seed=seed,
     )
-    
-    # Seeding
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
-    LOGGER.info(f"Starting training run. Output: {run_output_dir}")
+    _seed_everything(seed)
+    LOGGER.info('Starting training run. Output: %s', run_output_dir)
 
-    with time_logger.section("data_load"):
+    with time_logger.section('data_load'):
         graphs, label_to_idx, idx_to_label = load_graph_dataset(processed_data_path, label_mapping_path)
-    with time_logger.section("graph_variant_transform"):
+    with time_logger.section('graph_variant_transform'):
         graphs = transform_graphs_for_variant(
             graphs,
             graph_variant,
             processed_data_path=processed_data_path,
             strict_repro=strict_repro,
         )
-    with time_logger.section("feature_variant_transform"):
+    with time_logger.section('feature_variant_transform'):
         graphs = transform_graph_features_for_variant(
             graphs,
             feature_variant,
@@ -1856,23 +2029,25 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     time_logger.update(**class_filter_meta)
     time_logger.update(**_graph_structure_summary(graphs))
     if not graphs:
-        raise ValueError("No valid graphs loaded.")
-    
-    # Validation: Ensure num_classes covers all labels in the dataset
+        raise ValueError('No valid graphs loaded.')
+
     max_y = 0
     for g in graphs:
         if g.y is not None:
             max_y = max(max_y, int(g.y.item()))
-            
+
     num_classes = len(label_to_idx)
-    LOGGER.info(f"Detected {num_classes} classes from mapping. Max label index in data: {max_y}")
-    
+    LOGGER.info('Detected %d classes from mapping. Max label index in data: %d', num_classes, max_y)
     if max_y >= num_classes:
-        LOGGER.error(f"Data contains label index {max_y} which is >= num_classes {num_classes}. Adjusting num_classes to {max_y + 1} to prevent crash.")
+        LOGGER.error(
+            'Data contains label index %d which is >= num_classes %d. Adjusting num_classes to %d to prevent crash.',
+            max_y,
+            num_classes,
+            max_y + 1,
+        )
         num_classes = max_y + 1
-        
+
     input_dim = graphs[0].x.size(1)
-    
     text_emb_dim = 0
     if hasattr(graphs[0], 'doc_emb') and graphs[0].doc_emb is not None:
         text_emb_dim = graphs[0].doc_emb.size(1)
@@ -1887,72 +2062,97 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         test_ratio=0.2,
     )
     time_logger.update(**split_meta)
-    
-    # Use CPU-safe defaults locally; explicit overrides can re-enable workers on full lab machines.
+
     num_workers = _resolve_dataloader_workers(config)
-
-    # Only use pin_memory if CUDA is available to avoid warnings on CPU
     use_pin_memory = torch.cuda.is_available()
-    time_logger.update(dataloader_num_workers=num_workers, dataloader_pin_memory=use_pin_memory)
-    
-    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=use_pin_memory)
-    val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=use_pin_memory)
-    test_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=use_pin_memory)
-
-    # Model
-    if model_type == "GCN":
-        model = APTAttributionGCN(input_dim, 128, num_classes)
-    elif model_type == "GAT":
-        model = APTAttributionGAT(input_dim, 128, num_classes)
-    elif model_type == "HGT":
-        if HGTClassifier is None:
-            raise ValueError("HGT model is not available (ImportError).")
-        model = HGTClassifier(input_dim, 128, num_classes, num_node_types=40, heads=4, dropout=0.5)
-    elif model_type == "Transformer":
-        model = APTAttributionTransformer(input_dim, 128, num_classes)
-    elif model_type == "GraphSAGE":
-        model = APTAttributionGraphSAGE(input_dim, 128, num_classes, text_emb_dim=text_emb_dim)
-    elif model_type == "GIN":
-        model = APTAttributionGIN(input_dim, 128, num_classes)
-    elif model_type == "RGAT":
-        if RelationAwareGAT is None:
-            raise ValueError("RGAT model is not available (ImportError).")
-        # RGAT specific config
-        ablation_mode = config.get('ablation_mode', "dual")
-        model = RelationAwareGAT(
-            num_node_features=input_dim,
-            num_classes=num_classes,
-            hidden_dim=128,
-            num_heads=4,
-            dropout=0.5,
-            num_entity_types=40,  # Default safe upper bound
-            ablation_mode=ablation_mode,
-            use_gatv2=True,
-            fusion_mode=fusion_mode,
-            pooling_mode=pooling_mode,
-            rgcn_num_bases=rgcn_num_bases,
+    if dynamic_batch_by_graph_size:
+        max_nodes_per_batch = _resolve_graph_batch_budget(
+            config, train_graphs, batch_size, 'max_nodes_per_batch', _graph_num_nodes, multiplier=1.35
         )
-    else:
-        model = APTAttributionHybrid(input_dim, 128, num_classes)
-    
-    model = model.to(device)
+        max_edges_per_batch = _resolve_graph_batch_budget(
+            config, train_graphs, batch_size, 'max_edges_per_batch', _graph_num_edges, multiplier=1.35
+        )
+    time_logger.update(dataloader_num_workers=num_workers, dataloader_pin_memory=use_pin_memory)
 
-    # Compile model if supported (PyTorch 2.0+) - 默认关闭，便于多 seed 并行 + 调试
-    if config.get('use_compile', False) and hasattr(torch, 'compile') and os.name != 'nt':
-        try:
-            model = torch.compile(model)
-            LOGGER.info("Model compiled with torch.compile() for faster training.")
-        except Exception as e:
-            LOGGER.warning(f"Failed to compile model: {e}")
+    def _make_loader(dataset_graphs: List[Data], current_batch_size: int, shuffle: bool) -> DataLoader:
+        loader_kwargs = {
+            'num_workers': num_workers,
+            'pin_memory': use_pin_memory,
+        }
+        if dynamic_batch_by_graph_size:
+            loader_kwargs['batch_sampler'] = GraphBudgetBatchSampler(
+                dataset_graphs,
+                max_graphs=current_batch_size,
+                max_nodes_per_batch=max_nodes_per_batch,
+                max_edges_per_batch=max_edges_per_batch,
+                shuffle=shuffle,
+            )
+        else:
+            loader_kwargs['batch_size'] = current_batch_size
+            loader_kwargs['shuffle'] = shuffle
+        return DataLoader(dataset_graphs, **loader_kwargs)
 
-    # 多 GPU DataParallel：仅在显式启用、batch 足够大、设备数 >= 2 时启用
-    if config.get('multi_gpu_dp', False) and torch.cuda.device_count() >= 2 and batch_size >= 64:
-        model = torch.nn.DataParallel(model)
-        LOGGER.info(f"DataParallel enabled across {torch.cuda.device_count()} GPUs.")
+    def _build_loaders(current_batch_size: int) -> tuple[DataLoader, DataLoader, DataLoader]:
+        return (
+            _make_loader(train_graphs, current_batch_size, shuffle=True),
+            _make_loader(val_graphs, current_batch_size, shuffle=False),
+            _make_loader(test_graphs, current_batch_size, shuffle=False),
+        )
 
-    # 记录参数量和关键实验配置
-    time_logger.update(**count_params(model))
+    def _build_model(current_batch_size: int) -> torch.nn.Module:
+        if model_type == 'GCN':
+            built_model = APTAttributionGCN(input_dim, hidden_dim, num_classes, dropout=dropout)
+        elif model_type == 'GAT':
+            built_model = APTAttributionGAT(input_dim, hidden_dim, num_classes, dropout=dropout)
+        elif model_type == 'HGT':
+            if HGTClassifier is None:
+                raise ValueError('HGT model is not available (ImportError).')
+            built_model = HGTClassifier(input_dim, hidden_dim, num_classes, num_node_types=40, heads=4, dropout=dropout)
+        elif model_type == 'Transformer':
+            built_model = APTAttributionTransformer(input_dim, hidden_dim, num_classes, dropout=dropout)
+        elif model_type == 'GraphSAGE':
+            built_model = APTAttributionGraphSAGE(input_dim, hidden_dim, num_classes, dropout=dropout, text_emb_dim=text_emb_dim)
+        elif model_type == 'GIN':
+            built_model = APTAttributionGIN(input_dim, hidden_dim, num_classes, dropout=dropout)
+        elif model_type == 'RGAT':
+            if RelationAwareGAT is None:
+                raise ValueError('RGAT model is not available (ImportError).')
+            ablation_mode = config.get('ablation_mode', 'dual')
+            built_model = RelationAwareGAT(
+                num_node_features=input_dim,
+                num_classes=num_classes,
+                hidden_dim=hidden_dim,
+                num_heads=4,
+                dropout=dropout,
+                num_entity_types=40,
+                ablation_mode=ablation_mode,
+                use_gatv2=True,
+                fusion_mode=fusion_mode,
+                pooling_mode=pooling_mode,
+                rgcn_num_bases=rgcn_num_bases,
+            )
+        else:
+            built_model = APTAttributionHybrid(input_dim, hidden_dim, num_classes, dropout=dropout)
+
+        built_model = built_model.to(device)
+
+        if config.get('use_compile', False) and hasattr(torch, 'compile') and os.name != 'nt':
+            try:
+                built_model = torch.compile(built_model)
+                LOGGER.info('Model compiled with torch.compile() for faster training.')
+            except Exception as exc:
+                LOGGER.warning('Failed to compile model: %s', exc)
+
+        if config.get('multi_gpu_dp', False) and torch.cuda.device_count() >= 2 and current_batch_size >= 64:
+            built_model = torch.nn.DataParallel(built_model)
+            LOGGER.info('DataParallel enabled across %d GPUs.', torch.cuda.device_count())
+
+        return built_model
+
+    class_weights = _class_weight_tensor(train_graphs, num_classes, device)
     time_logger.update(
+        class_weighting='inverse_frequency',
+        class_weights=[round(float(value), 6) for value in class_weights.detach().cpu()],
         loss_type=loss_type,
         focal_gamma=focal_gamma,
         fusion_mode=fusion_mode,
@@ -1961,144 +2161,222 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         enable_micro_benchmark=enable_micro_benchmark,
         enable_flops=enable_flops,
         inference_benchmark_samples=inference_benchmark_samples,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        clip_norm=clip_norm,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        auto_scale_accumulation=auto_scale_accumulation,
+        mixed_precision=mixed_precision,
+        dynamic_batch_by_graph_size=dynamic_batch_by_graph_size,
+        max_nodes_per_batch=max_nodes_per_batch,
+        max_edges_per_batch=max_edges_per_batch,
     )
 
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
-    class_weights = _class_weight_tensor(train_graphs, num_classes, device)
-    time_logger.update(
-        class_weighting="inverse_frequency",
-        class_weights=[round(float(value), 6) for value in class_weights.detach().cpu()],
-    )
-    if loss_type == "focal":
-        criterion = FocalLoss(gamma=focal_gamma, weight=class_weights)
-    elif loss_type in {"cross_entropy", "ce"}:
-        criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
-    
-    # Initialize GradScaler for AMP
-    scaler = GradScaler() if torch.cuda.is_available() else None
-    
-    best_val_acc = 0.0
-    best_val_loss = float('inf')
-    best_model_loss = float('inf')
-    best_model_path = run_output_dir / "best_model.pt"
-    
-    # Early Stopping Config
-    early_stop_patience = 25
-    no_improve_epochs = 0
-    
-    history = {
-        "train_loss": [],
-        "train_acc": [],
-        "val_loss": [],
-        "val_acc": []
-    }
+    current_batch_size = max(batch_size, min_batch_size)
+    attempted_batch_sizes: List[int] = []
+    current_accumulation_steps = gradient_accumulation_steps
+    best_model_path = run_output_dir / 'best_model.pt'
 
-    best_epoch_idx = 0
-    early_stop_epoch = None
-    train_total_t0 = time.perf_counter()
-
-    for epoch in range(epochs):
-        _t_train_start = time.perf_counter()
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device, scaler=scaler)
-        _t_train_end = time.perf_counter()
-        val_loss, val_acc, val_f1 = validate(model, val_loader, criterion, device)
-        _t_val_end = time.perf_counter()
-
-        # 记录每轮耗时
-        time_logger.add_epoch_time(
-            train=_t_train_end - _t_train_start,
-            val=_t_val_end - _t_train_end,
-            data_load=0.0,  # PyG DataLoader 内联在 train_epoch 中，无法准确分离
-        )
-
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-
-        scheduler.step(val_loss)
-
-        # Save best model logic: Priority 1 = Accuracy (Max), Priority 2 = Loss (Min)
-        is_best = False
-        if val_acc > best_val_acc:
-            is_best = True
-        elif val_acc == best_val_acc:
-            if val_loss < best_model_loss:
-                is_best = True
-
-        if is_best:
-            best_val_acc = val_acc
-            best_model_loss = val_loss
-            best_epoch_idx = epoch + 1
-            # 保存 state_dict；若被 DataParallel 包裹则取 module
-            state_to_save = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
-            torch.save(state_to_save, best_model_path)
-            LOGGER.info(f"Epoch {epoch+1}: New best model saved (Acc={val_acc:.4f}, Loss={val_loss:.4f})")
-
-        # Early Stopping based on Loss (Prevent Overfitting)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            no_improve_epochs = 0
-        else:
-            no_improve_epochs += 1
-
-        LOGGER.info(f"Epoch {epoch+1}/{epochs}: Train Loss={train_loss:.4f} Acc={train_acc:.4f} | Val Loss={val_loss:.4f} Acc={val_acc:.4f} | Patience={no_improve_epochs}/{early_stop_patience}")
-
-        if no_improve_epochs >= early_stop_patience:
-            early_stop_epoch = epoch + 1
-            LOGGER.info(f"Early stopping triggered at epoch {epoch+1} (Val Loss did not improve for {early_stop_patience} epochs)")
-            break
-
-    train_total_t1 = time.perf_counter()
-    time_logger.update(
-        best_epoch=best_epoch_idx,
-        early_stop_epoch=early_stop_epoch,
-        train_total_wall_s=round(train_total_t1 - train_total_t0, 4),
-    )
-
-    # Plot History
-    history_plot_path = run_output_dir / "training_history.png"
-    try:
-        plot_training_history(history, history_plot_path)
-    except Exception as e:
-        LOGGER.warning(f"Failed to plot history: {e}")
-
-    # ========================================================================
-    # Final Evaluation
-    # ========================================================================
-    model_to_load = model.module if isinstance(model, torch.nn.DataParallel) else model
-    model_to_load.load_state_dict(torch.load(best_model_path, map_location=device))
-    eval_model = model_to_load
-
-    eval_model.eval()
-    with time_logger.section("test_eval"):
-        val_logits, val_labels = _collect_logits_and_labels(eval_model, val_loader, device)
-        temperature = _fit_temperature(val_logits, val_labels) if use_temperature_calibration else 1.0
-        test_logits, test_labels = _collect_logits_and_labels(eval_model, test_loader, device)
-        calibrated_logits = test_logits / max(temperature, 1e-6) if test_logits.numel() else test_logits
-        all_preds = calibrated_logits.argmax(dim=1).cpu().numpy().tolist() if calibrated_logits.numel() else []
-        all_labels = test_labels.cpu().numpy().tolist()
+    while True:
+        _seed_everything(seed)
+        attempted_batch_sizes.append(current_batch_size)
+        config['batch_size'] = current_batch_size
+        config['gradient_accumulation_steps'] = current_accumulation_steps
+        config['batch_size_attempts'] = attempted_batch_sizes.copy()
         time_logger.update(
-            temperature=round(float(temperature), 6),
-            use_temperature_calibration=use_temperature_calibration,
-            val_nll_uncalibrated=round(_nll_for_temperature(val_logits, val_labels, 1.0), 6),
-            val_nll_calibrated=round(_nll_for_temperature(val_logits, val_labels, temperature), 6),
-            test_nll_calibrated=round(_nll_for_temperature(test_logits, test_labels, temperature), 6),
+            batch_size=current_batch_size,
+            batch_size_effective=current_batch_size * current_accumulation_steps,
+            batch_size_attempts=attempted_batch_sizes.copy(),
+            gradient_accumulation_steps=current_accumulation_steps,
         )
 
-    # 7 项分类指标（论文公式 27–33）
-    test_acc = float(accuracy_score(all_labels, all_preds))
-    test_w_p = float(precision_score(all_labels, all_preds, average="weighted", zero_division=0))
-    test_w_r = float(recall_score(all_labels, all_preds, average="weighted", zero_division=0))
-    test_w_f1 = float(f1_score(all_labels, all_preds, average="weighted", zero_division=0))
-    test_m_p = float(precision_score(all_labels, all_preds, average="macro", zero_division=0))
-    test_m_r = float(recall_score(all_labels, all_preds, average="macro", zero_division=0))
-    test_m_f1 = float(f1_score(all_labels, all_preds, average="macro", zero_division=0))
+        train_loader, val_loader, test_loader = _build_loaders(current_batch_size)
+        model = _build_model(current_batch_size)
+        time_logger.update(**count_params(model))
 
-    # Classification report
+        optimizer = AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
+        if loss_type == 'focal':
+            criterion = FocalLoss(gamma=focal_gamma, weight=class_weights)
+        elif loss_type in {'cross_entropy', 'ce'}:
+            criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+        else:
+            raise ValueError(f'Unsupported loss_type: {loss_type}')
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        scaler = GradScaler() if (torch.cuda.is_available() and mixed_precision) else None
+
+        best_val_acc = 0.0
+        best_val_loss = float('inf')
+        best_model_loss = float('inf')
+        early_stop_patience = 25
+        no_improve_epochs = 0
+        history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+        }
+        best_epoch_idx = 0
+        early_stop_epoch = None
+
+        if best_model_path.exists():
+            best_model_path.unlink()
+
+        try:
+            train_total_t0 = time.perf_counter()
+
+            for epoch in range(epochs):
+                t_train_start = time.perf_counter()
+                train_loss, train_acc = train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    criterion,
+                    device,
+                    scaler=scaler,
+                    clip_norm=clip_norm,
+                    gradient_accumulation_steps=current_accumulation_steps,
+                    use_amp=mixed_precision,
+                )
+                t_train_end = time.perf_counter()
+                val_loss, val_acc, val_f1 = validate(model, val_loader, criterion, device)
+                t_val_end = time.perf_counter()
+
+                time_logger.add_epoch_time(
+                    train=t_train_end - t_train_start,
+                    val=t_val_end - t_train_end,
+                    data_load=0.0,
+                )
+
+                history['train_loss'].append(train_loss)
+                history['train_acc'].append(train_acc)
+                history['val_loss'].append(val_loss)
+                history['val_acc'].append(val_acc)
+
+                scheduler.step(val_loss)
+
+                is_best = False
+                if val_acc > best_val_acc:
+                    is_best = True
+                elif val_acc == best_val_acc and val_loss < best_model_loss:
+                    is_best = True
+
+                if is_best:
+                    best_val_acc = val_acc
+                    best_model_loss = val_loss
+                    best_epoch_idx = epoch + 1
+                    state_to_save = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+                    torch.save(state_to_save, best_model_path)
+                    LOGGER.info('Epoch %d: New best model saved (Acc=%.4f, Loss=%.4f)', epoch + 1, val_acc, val_loss)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    no_improve_epochs = 0
+                else:
+                    no_improve_epochs += 1
+
+                LOGGER.info(
+                    'Epoch %d/%d: Train Loss=%.4f Acc=%.4f | Val Loss=%.4f Acc=%.4f | Patience=%d/%d',
+                    epoch + 1,
+                    epochs,
+                    train_loss,
+                    train_acc,
+                    val_loss,
+                    val_acc,
+                    no_improve_epochs,
+                    early_stop_patience,
+                )
+
+                if no_improve_epochs >= early_stop_patience:
+                    early_stop_epoch = epoch + 1
+                    LOGGER.info(
+                        'Early stopping triggered at epoch %d (Val Loss did not improve for %d epochs)',
+                        epoch + 1,
+                        early_stop_patience,
+                    )
+                    break
+
+            train_total_t1 = time.perf_counter()
+            time_logger.update(
+                best_epoch=best_epoch_idx,
+                early_stop_epoch=early_stop_epoch,
+                train_total_wall_s=round(train_total_t1 - train_total_t0, 4),
+            )
+
+            history_plot_path = run_output_dir / 'training_history.png'
+            try:
+                plot_training_history(history, history_plot_path)
+            except Exception as exc:
+                LOGGER.warning('Failed to plot history: %s', exc)
+
+            model_to_load = model.module if isinstance(model, torch.nn.DataParallel) else model
+            model_to_load.load_state_dict(torch.load(best_model_path, map_location=device))
+            eval_model = model_to_load
+
+            eval_model.eval()
+            with time_logger.section('test_eval'):
+                val_logits, val_labels = _collect_logits_and_labels(eval_model, val_loader, device)
+                temperature = _fit_temperature(val_logits, val_labels) if use_temperature_calibration else 1.0
+                test_logits, test_labels = _collect_logits_and_labels(eval_model, test_loader, device)
+                calibrated_logits = test_logits / max(temperature, 1e-6) if test_logits.numel() else test_logits
+                all_preds = calibrated_logits.argmax(dim=1).cpu().numpy().tolist() if calibrated_logits.numel() else []
+                all_labels = test_labels.cpu().numpy().tolist()
+                time_logger.update(
+                    temperature=round(float(temperature), 6),
+                    use_temperature_calibration=use_temperature_calibration,
+                    val_nll_uncalibrated=round(_nll_for_temperature(val_logits, val_labels, 1.0), 6),
+                    val_nll_calibrated=round(_nll_for_temperature(val_logits, val_labels, temperature), 6),
+                    test_nll_calibrated=round(_nll_for_temperature(test_logits, test_labels, temperature), 6),
+                )
+            break
+        except RuntimeError as exc:
+            should_retry = (
+                device.type == 'cuda'
+                and auto_shrink_batch_size
+                and _is_cuda_oom(exc)
+                and current_batch_size > min_batch_size
+            )
+            if not should_retry:
+                if device.type == 'cuda' and _is_cuda_oom(exc):
+                    raise RuntimeError(
+                        f'CUDA out of memory with batch_size={current_batch_size}. '
+                        f'Attempted batch sizes: {attempted_batch_sizes}. '
+                        f'Try a smaller hidden_dim, a simpler graph variant, or train on a larger GPU.'
+                    ) from exc
+                raise
+
+            next_batch_size = max(min_batch_size, current_batch_size // 2)
+            next_accumulation_steps = current_accumulation_steps
+            if auto_scale_accumulation:
+                target_effective_batch = max(1, batch_size * gradient_accumulation_steps)
+                next_accumulation_steps = max(
+                    current_accumulation_steps,
+                    int(math.ceil(target_effective_batch / max(1, next_batch_size))),
+                )
+            if next_batch_size >= current_batch_size and next_accumulation_steps <= current_accumulation_steps:
+                raise
+            LOGGER.warning(
+                'CUDA OOM with batch_size=%d and accumulation=%d. Releasing memory and retrying with batch_size=%d and accumulation=%d.',
+                current_batch_size,
+                current_accumulation_steps,
+                next_batch_size,
+                next_accumulation_steps,
+            )
+            try:
+                del model, train_loader, val_loader, test_loader, optimizer, scheduler, scaler
+            except Exception:
+                pass
+            _release_cuda_memory()
+            current_batch_size = next_batch_size
+            current_accumulation_steps = next_accumulation_steps
+
+    test_acc = float(accuracy_score(all_labels, all_preds))
+    test_w_p = float(precision_score(all_labels, all_preds, average='weighted', zero_division=0))
+    test_w_r = float(recall_score(all_labels, all_preds, average='weighted', zero_division=0))
+    test_w_f1 = float(f1_score(all_labels, all_preds, average='weighted', zero_division=0))
+    test_m_p = float(precision_score(all_labels, all_preds, average='macro', zero_division=0))
+    test_m_r = float(recall_score(all_labels, all_preds, average='macro', zero_division=0))
+    test_m_f1 = float(f1_score(all_labels, all_preds, average='macro', zero_division=0))
+
     all_class_ids = list(range(len(idx_to_label)))
     target_names = [idx_to_label[i] for i in all_class_ids]
     cls_report = classification_report(
@@ -2106,50 +2384,45 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         output_dict=True, zero_division=0,
     )
 
-    # Confusion Matrix
-    cm_plot_path = run_output_dir / "confusion_matrix.png"
+    cm_plot_path = run_output_dir / 'confusion_matrix.png'
     try:
         plot_confusion_matrix(all_labels, all_preds, target_names, cm_plot_path)
-    except Exception as e:
-        LOGGER.warning(f"Failed to plot confusion matrix: {e}")
+    except Exception as exc:
+        LOGGER.warning('Failed to plot confusion matrix: %s', exc)
 
-    topk_path = run_output_dir / "topk_predictions.json"
+    topk_path = run_output_dir / 'topk_predictions.json'
     try:
-        report_ids = [str(getattr(graph, "report_id", f"test_{idx}")) for idx, graph in enumerate(test_graphs)]
+        report_ids = [str(getattr(graph, 'report_id', f'test_{idx}')) for idx, graph in enumerate(test_graphs)]
         topk_path.write_text(
             json.dumps(
                 _topk_records(test_logits, test_labels, report_ids, idx_to_label, temperature, k=3),
                 ensure_ascii=False,
                 indent=2,
             ),
-            encoding="utf-8",
+            encoding='utf-8',
         )
-    except Exception as e:
-        LOGGER.warning(f"Failed to write top-k predictions: {e}")
+    except Exception as exc:
+        LOGGER.warning('Failed to write top-k predictions: %s', exc)
 
-    gate_summary_path = run_output_dir / "gate_summary.json"
+    gate_summary_path = run_output_dir / 'gate_summary.json'
     gate_summary = None
-    if model_type == "RGAT":
+    if model_type == 'RGAT':
         try:
             gate_summary = _summarize_rgat_gate_attention(eval_model, test_loader, device, gate_summary_path)
             if gate_summary:
-                gate_alpha_stats = gate_summary.get("gate_alpha", {})
+                gate_alpha_stats = gate_summary.get('gate_alpha', {})
                 time_logger.update(
-                    gate_semantic_mean=gate_summary.get("semantic_gate_mean"),
-                    gate_structural_mean=gate_summary.get("structural_gate_mean"),
-                    gate_node_count=gate_alpha_stats.get("count", 0),
-                    gate_semantic_dominant_ratio=gate_alpha_stats.get("semantic_dominant_ratio"),
-                    gate_structural_dominant_ratio=gate_alpha_stats.get("structural_dominant_ratio"),
+                    gate_semantic_mean=gate_summary.get('semantic_gate_mean'),
+                    gate_structural_mean=gate_summary.get('structural_gate_mean'),
+                    gate_node_count=gate_alpha_stats.get('count', 0),
+                    gate_semantic_dominant_ratio=gate_alpha_stats.get('semantic_dominant_ratio'),
+                    gate_structural_dominant_ratio=gate_alpha_stats.get('structural_dominant_ratio'),
                 )
-        except Exception as e:
-            LOGGER.warning(f"Failed to write RGAT gate summary: {e}")
+        except Exception as exc:
+            LOGGER.warning('Failed to write RGAT gate summary: %s', exc)
 
-    # ========================================================================
-    # 时间细化：forward/backward micro-benchmark + 推理延迟
-    # ========================================================================
     eval_model.train()
     try:
-        # 取一个 batch 做 5 次前向 / 反向计时
         sample_batches = []
         for b in train_loader:
             sample_batches.append(b)
@@ -2157,20 +2430,16 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 break
         if sample_batches:
             sample_batch = sample_batches[0].to(device)
-            # warmup
             for _ in range(2):
                 _doc = sample_batch.doc_emb if hasattr(sample_batch, 'doc_emb') else None
-                _o = eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch, doc_emb=_doc) \
-                    if isinstance(eval_model, APTAttributionGraphSAGE) else eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch)
+                _o = eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch, doc_emb=_doc) if isinstance(eval_model, APTAttributionGraphSAGE) else eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch)
                 _loss = criterion(_o, sample_batch.y)
                 _loss.backward()
-            # measure
             for _ in range(5):
                 ft = CudaTimer(device)
                 ft.start()
                 _doc = sample_batch.doc_emb if hasattr(sample_batch, 'doc_emb') else None
-                _o = eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch, doc_emb=_doc) \
-                    if isinstance(eval_model, APTAttributionGraphSAGE) else eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch)
+                _o = eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch, doc_emb=_doc) if isinstance(eval_model, APTAttributionGraphSAGE) else eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch)
                 f_ms = ft.stop()
                 time_logger.add_forward_ms(f_ms)
 
@@ -2180,10 +2449,9 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 _loss.backward()
                 b_ms = bt.stop()
                 time_logger.add_backward_ms(b_ms)
-    except Exception as e:
-        LOGGER.warning(f"forward/backward micro-bench failed: {e}")
+    except Exception as exc:
+        LOGGER.warning('forward/backward micro-bench failed: %s', exc)
 
-    # 推理延迟：单样本 100 次（不足则取全部测试集）
     eval_model.eval()
     try:
         inf_samples = test_graphs[: min(max(0, inference_benchmark_samples), len(test_graphs))]
@@ -2205,58 +2473,57 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 inference_per_sample_ms=round(sum(inf_ms_list) / len(inf_ms_list), 4),
                 inference_samples_used=len(inf_ms_list),
             )
-    except Exception as e:
-        LOGGER.warning(f"inference latency benchmark failed: {e}")
+    except Exception as exc:
+        LOGGER.warning('inference latency benchmark failed: %s', exc)
 
-    # FLOPs (best-effort)
     try:
         def _sample_input_fn():
             g = test_graphs[0].to(device)
             bidx = torch.zeros(g.x.size(0), dtype=torch.long, device=device)
             return (g.x, g.edge_index, bidx)
+
         flops = count_flops_safe(eval_model, _sample_input_fn)
         if flops is not None:
             time_logger.update(flops_per_forward=int(flops))
-    except Exception as e:
-        LOGGER.debug(f"FLOPs estimation skipped: {e}")
+    except Exception as exc:
+        LOGGER.debug('FLOPs estimation skipped: %s', exc)
 
-    # 保存 time_log.json + metrics.json
     time_logger.finalize()
-    time_log_path = run_output_dir / "time_log.json"
+    time_log_path = run_output_dir / 'time_log.json'
     time_logger.save(time_log_path)
 
     metrics = {
-        "accuracy": test_acc,
-        "weighted_precision": test_w_p,
-        "weighted_recall": test_w_r,
-        "weighted_f1": test_w_f1,
-        "macro_precision": test_m_p,
-        "macro_recall": test_m_r,
-        "macro_f1": test_m_f1,
+        'accuracy': test_acc,
+        'weighted_precision': test_w_p,
+        'weighted_recall': test_w_r,
+        'weighted_f1': test_w_f1,
+        'macro_precision': test_m_p,
+        'macro_recall': test_m_r,
+        'macro_f1': test_m_f1,
     }
-    with (run_output_dir / "metrics.json").open("w", encoding="utf-8") as fp:
+    with (run_output_dir / 'metrics.json').open('w', encoding='utf-8') as fp:
         json.dump(metrics, fp, ensure_ascii=False, indent=2)
 
     results = {
-        # 兼容旧字段
-        "test_accuracy": test_acc,
-        "test_f1_weighted": test_w_f1,
-        # 完整 7 项
-        "metrics": metrics,
-        "config": config,
-        "model_path": str(best_model_path),
-        "time_log_path": str(time_log_path),
-        "temperature": round(float(temperature), 6),
-        "topk_predictions_path": str(topk_path) if topk_path.exists() else None,
-        "gate_summary_path": str(gate_summary_path) if gate_summary_path.exists() else None,
-        "gate_summary": gate_summary,
-        "history_plot": str(history_plot_path) if history_plot_path.exists() else None,
-        "confusion_matrix_plot": str(cm_plot_path) if cm_plot_path.exists() else None,
-        "classification_report": cls_report,
-        "history": history,
+        'test_accuracy': test_acc,
+        'test_f1_weighted': test_w_f1,
+        'metrics': metrics,
+        'config': config,
+        'model_path': str(best_model_path),
+        'time_log_path': str(time_log_path),
+        'temperature': round(float(temperature), 6),
+        'topk_predictions_path': str(topk_path) if topk_path.exists() else None,
+        'gate_summary_path': str(gate_summary_path) if gate_summary_path.exists() else None,
+        'gate_summary': gate_summary,
+        'history_plot': str(history_plot_path) if history_plot_path.exists() else None,
+        'confusion_matrix_plot': str(cm_plot_path) if cm_plot_path.exists() else None,
+        'classification_report': cls_report,
+        'history': history,
     }
 
-    with (run_output_dir / "results.json").open("w", encoding="utf-8") as f:
+    with (run_output_dir / 'results.json').open('w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, default=str)
 
     return results
+
+

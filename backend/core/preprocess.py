@@ -37,6 +37,11 @@ except ImportError:
     chardet = None
 
 try:
+    import easyocr  # type: ignore
+except ImportError:
+    easyocr = None
+
+try:
     from langdetect import DetectorFactory, detect_langs  # type: ignore
 except ImportError:
     DetectorFactory = None
@@ -83,6 +88,28 @@ if sys.platform == 'win32':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 LOGGER = logging.getLogger(__name__)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_embedding_model_path(model_spec: str) -> str:
+    """Prefer a local model directory before falling back to a hub identifier."""
+    if not model_spec:
+        return model_spec
+
+    candidate = Path(model_spec)
+    if candidate.exists():
+        return str(candidate.resolve())
+
+    search_roots = [
+        REPO_ROOT,
+        Path.cwd(),
+    ]
+    for root in search_roots:
+        local_dir = root / model_spec
+        if local_dir.exists() and local_dir.is_dir():
+            return str(local_dir.resolve())
+
+    return model_spec
 
 # ============================================================================
 # 数据类定义
@@ -283,6 +310,64 @@ def load_json_text(path: Path) -> str:
         return load_txt_text(path)
 
 
+# OCR fallback configuration (for scanned / image-only PDFs)
+OCR_DPI = 200          # 渲染分辨率，兼顾准确率与速度
+OCR_MAX_PAGES = 50     # 安全上限，避免超大扫描件无限运行
+OCR_LANGUAGES = ["en", "ch_sim"]
+_OCR_READER = None     # 模块级懒加载单例
+
+
+def _get_ocr_reader():
+    """惰性构建共享的 EasyOCR Reader（若 torch 检测到 CUDA 则使用 GPU）。"""
+    global _OCR_READER
+    if easyocr is None or np is None:
+        return None
+    if _OCR_READER is None:
+        use_gpu = bool(torch is not None and torch.cuda.is_available())
+        try:
+            _OCR_READER = easyocr.Reader(OCR_LANGUAGES, gpu=use_gpu)
+        except Exception as exc:
+            LOGGER.warning("Failed to initialize EasyOCR reader: %s", exc)
+            return None
+    return _OCR_READER
+
+
+def ocr_pdf_text(path: Path) -> str:
+    """对扫描型 PDF 逐页渲染为图像并做 OCR，作为最终兜底。"""
+    reader = _get_ocr_reader()
+    if reader is None or fitz is None or np is None:
+        return ""
+    try:
+        doc = fitz.open(str(path))
+    except Exception as e:
+        LOGGER.error("OCR: failed to open %s: %s", path, e)
+        return ""
+
+    parts: List[str] = []
+    try:
+        zoom = OCR_DPI / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        for page_no, page in enumerate(doc):
+            if page_no >= OCR_MAX_PAGES:
+                LOGGER.warning("OCR: %s exceeds %d pages; truncating.", path, OCR_MAX_PAGES)
+                break
+            try:
+                pix = page.get_pixmap(matrix=matrix)
+                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                if pix.n == 4:  # 去掉 alpha 通道
+                    img = img[:, :, :3]
+                lines = reader.readtext(img, detail=0, paragraph=True)
+            except Exception as e:
+                LOGGER.warning("OCR: failed on page %d of %s: %s", page_no, path, e)
+                continue
+            if lines:
+                parts.append(_normalize_block("\n".join(lines)))
+    finally:
+        doc.close()
+
+    return "\n\n".join(p for p in parts if p)
+
+
 def load_pdf_text(path: Path) -> str:
     """从PDF提取文本"""
     # 优先使用 pdfplumber，因为它通常能更好地保持文本顺序
@@ -303,45 +388,50 @@ def load_pdf_text(path: Path) -> str:
 
     if fitz is None:
         if pdfplumber is None:
-            # 如果没有PDF库，返回空或报错，这里选择返回空字符串避免崩溃
-            LOGGER.warning("PDF extraction requires 'pdfplumber' or 'pymupdf' (fitz). Please install one of them.")
-            return ""
+            # 没有任何文本层提取库，尝试 OCR 兜底
+            LOGGER.warning("PDF extraction requires 'pdfplumber' or 'pymupdf' (fitz); attempting OCR.")
         else:
-             # pdfplumber failed and fitz is missing
-             LOGGER.warning("pdfplumber failed and fitz is not available.")
-             return ""
+            # pdfplumber failed/empty and fitz is missing
+            LOGGER.warning("pdfplumber produced no text and fitz is not available; attempting OCR.")
+    else:
+        try:
+            doc = fitz.open(str(path))
+            blocks: List[str] = []
+            scanned_pages = 0
 
-    try:
-        doc = fitz.open(str(path))
-        blocks: List[str] = []
-        scanned_pages = 0
-
-        for page in doc:
-            page_blocks = page.get_text("blocks")
-            if not page_blocks:
-                scanned_pages += 1
-                continue
-            for block in page_blocks:
-                if len(block) < 5:
+            for page in doc:
+                page_blocks = page.get_text("blocks")
+                if not page_blocks:
+                    scanned_pages += 1
                     continue
-                text = block[4].strip()
-                if len(text) < BLOCK_MIN_CHARS:
-                    continue
-                if _is_header_or_footer(text):
-                    continue
-                blocks.append(text)
+                for block in page_blocks:
+                    if len(block) < 5:
+                        continue
+                    text = block[4].strip()
+                    if len(text) < BLOCK_MIN_CHARS:
+                        continue
+                    if _is_header_or_footer(text):
+                        continue
+                    blocks.append(text)
 
-        doc.close()
+            doc.close()
 
-        if blocks:
-            combined = "\n\n".join(_normalize_block(block) for block in blocks)
-            return combined
+            if blocks:
+                combined = "\n\n".join(_normalize_block(block) for block in blocks)
+                return combined
 
-        LOGGER.warning("No text blocks extracted from %s using fitz; likely scanned.", path)
-        return ""
-    except Exception as e:
-        LOGGER.error(f"Failed to extract PDF text with fitz for {path}: {e}")
-        return ""
+            LOGGER.warning("No text blocks extracted from %s using fitz; attempting OCR.", path)
+        except Exception as e:
+            LOGGER.error(f"Failed to extract PDF text with fitz for {path}: {e}")
+
+    # 最终兜底：对扫描型 / 图像型 PDF 做 OCR
+    ocr_text = ocr_pdf_text(path)
+    if ocr_text.strip():
+        LOGGER.info("OCR recovered %d chars from %s", len(ocr_text), path)
+        return ocr_text
+
+    LOGGER.warning("OCR produced no text for %s; treating as empty.", path)
+    return ""
 
 
 def load_txt_text(path: Path) -> str:
@@ -848,7 +938,7 @@ class PreprocessConfig:
     min_paragraph_length: int = 20
     skip_empty: bool = True
     only_txt: bool = False
-    deduplicate_reports: bool = True
+    deduplicate_reports: bool = False
     near_duplicate_jaccard: float = 0.92
 
 
@@ -1072,8 +1162,9 @@ class GraphDatasetBuilder:
         if self.config.use_text_embedding and SentenceTransformer is not None and self.config.embedding_model:
             try:
                 st_device = preferred_sentence_transformer_device()
-                LOGGER.info(f"Loading embedding model: {self.config.embedding_model} on {st_device}")
-                self.embedder = SentenceTransformer(self.config.embedding_model, device=st_device)
+                resolved_model = resolve_embedding_model_path(self.config.embedding_model)
+                LOGGER.info(f"Loading embedding model: {resolved_model} on {st_device}")
+                self.embedder = SentenceTransformer(resolved_model, device=st_device)
                 self.embedding_dim = int(self.embedder.get_sentence_embedding_dimension())
             except Exception as e:
                 LOGGER.warning(f"Failed to load embedding model: {e}")

@@ -645,6 +645,7 @@ def run_inference_pipeline(
     if output_dir:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
+        summary["output_dir"] = str(output_path)
         with (output_path / "inference_results.json").open("w", encoding="utf-8") as fp:
             json.dump(summary, fp, indent=2, ensure_ascii=False)
 

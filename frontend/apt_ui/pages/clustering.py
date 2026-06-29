@@ -5,7 +5,13 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-from apt_ui.services.api_client import invalidate, get_artifact_bytes, get_json, request
+from apt_ui.services.api_client import (
+    get_artifact_bytes,
+    get_json,
+    get_runtime_config,
+    invalidate,
+    request,
+)
 from apt_ui.services.charting import PLOTLY_CHART_CONFIG, apply_layout
 from apt_ui.services.tasks import get_task_detail
 from apt_ui.services.task_ui import TaskAction, default_delete_action, render_task_panel
@@ -130,6 +136,12 @@ def _render_result_panel() -> None:
 
 
 def render_clustering() -> None:
+    runtime_config = get_runtime_config()
+    if not runtime_config.get("training_ui_enabled", True):
+        ui.page_header("Model Training", "Disabled In This Deployment", icon="fa-project-diagram")
+        st.info("当前部署已关闭模型训练展示与训练提交能力。")
+        return
+
     ui.page_header("模型训练", "Model Training", icon="fa-project-diagram")
 
     datasets = _get_datasets()

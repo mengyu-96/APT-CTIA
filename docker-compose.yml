@@ -8,11 +8,20 @@ services:
     container_name: apt_attribution_backend
     ports:
       - "5001:5001"
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app:/app/backend
+      DEMO_MODE: ${DEMO_MODE:-true}
+      ENABLE_PREPROCESSING: ${ENABLE_PREPROCESSING:-true}
+      ENABLE_INFERENCE: ${ENABLE_INFERENCE:-true}
+      ENABLE_TRAINING: ${ENABLE_TRAINING:-false}
+      SHOW_TRAINING_UI: ${SHOW_TRAINING_UI:-false}
+      ALLOW_TRAINING_REPORT_SOURCE: ${ALLOW_TRAINING_REPORT_SOURCE:-false}
     volumes:
       - ./dataset_TXT:/app/dataset_TXT
       - ./results_archive:/app/results_archive
       - ./uploads:/app/uploads
-      - ./reports:/app/reports
     restart: unless-stopped
 
   frontend:
@@ -22,8 +31,14 @@ services:
     container_name: apt_attribution_frontend
     ports:
       - "8501:8501"
+    env_file:
+      - .env
     environment:
-      - BACKEND_URL=http://backend:5001
+      BACKEND_URL: ${BACKEND_URL:-http://backend:5001}
+      ENABLE_UI_AUTH: ${ENABLE_UI_AUTH:-true}
+      AUTH_USERNAME: ${AUTH_USERNAME:-admin}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-admin}
+      AUTH_SESSION_SECRET: ${AUTH_SESSION_SECRET:-rgapt-session-secret}
     depends_on:
       - backend
     restart: unless-stopped

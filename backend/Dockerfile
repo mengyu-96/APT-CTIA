@@ -8,7 +8,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
-    software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the backend requirements file into the container
@@ -29,11 +28,11 @@ RUN mkdir -p /app/uploads \
     /app/reports
 
 # Set environment variables
-ENV PYTHONPATH=/app/backend
+ENV PYTHONPATH=/app:/app/backend
 ENV FLASK_APP=backend/api.py
 
 # Expose port 5001
 EXPOSE 5001
 
-# Run api.py when the container launches
-CMD ["python", "backend/api.py"]
+# Run the API with a production WSGI server.
+CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "1", "--threads", "4", "--timeout", "300", "backend.wsgi:app"]

@@ -136,6 +136,20 @@ def get_json(
 
 
 @st.cache_data(ttl=30, show_spinner=False)
+def get_runtime_config() -> dict[str, Any]:
+    default_config = {
+        "demo_mode": False,
+        "preprocessing_enabled": True,
+        "inference_enabled": True,
+        "training_enabled": True,
+        "training_ui_enabled": True,
+        "training_report_source_enabled": True,
+    }
+    data = get_json("/api/runtime_config", timeout=1.5, default=default_config, ttl="default")
+    return data if isinstance(data, dict) else default_config
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def get_dashboard_counts() -> dict[str, int]:
     return {
         "datasets": len(get_json("/api/datasets", timeout=1.5, default=[])),

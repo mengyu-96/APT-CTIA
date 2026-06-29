@@ -14,8 +14,16 @@ It intentionally excludes experiment scripts, reproduction code, datasets, gener
 ## Run With Docker Compose
 
 ```bash
+cp .env.example .env
 docker compose up --build
 ```
+
+The default compose setup is now tuned for a demo deployment:
+
+- training submission is disabled by default
+- preprocessing, inference, report export, and model/result browsing stay enabled
+- frontend auth credentials come from `.env`
+- backend runs with `gunicorn` instead of the Flask dev server
 
 Services:
 
@@ -26,8 +34,26 @@ Runtime data directories are mounted but not versioned:
 
 - `dataset_TXT/`
 - `uploads/`
-- `reports/`
 - `results_archive/`
+
+## Demo Deployment Strategy
+
+For a low-cost competition demo, the recommended approach is:
+
+1. train models locally
+2. copy only the required runtime artifacts to the server
+3. keep `ENABLE_TRAINING=false` on the server
+
+Artifacts typically needed on the server:
+
+- raw reports under `dataset_TXT/` if you want live preprocessing
+- processed datasets under `results_archive/processed_data/`
+- trained models under `results_archive/training_runs/`
+- optional past attribution outputs under `results_archive/attribution_results/`
+
+This keeps the server focused on display, preprocessing, inference, and report generation instead of expensive training workloads.
+
+Detailed deployment notes are in `DEPLOYMENT.md`.
 
 ## Run Locally
 

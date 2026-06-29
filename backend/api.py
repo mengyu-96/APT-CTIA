@@ -9,9 +9,14 @@ import time
 from typing import Any
 
 from core.preprocess import run_preprocessing_pipeline
-from core.train import run_training_pipeline
 from core.inference import run_inference_pipeline
 from core.report_generator import ReportGenerator
+from runtime_config import (
+    ENABLE_INFERENCE,
+    ENABLE_PREPROCESSING,
+    ENABLE_TRAINING,
+    build_runtime_config,
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,6 +49,13 @@ PROCESSED_DATA_DIR.mkdir(exist_ok=True)
 TRAINING_RUNS_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 
+
+def _feature_disabled_response(feature: str):
+    return jsonify({
+        "error": f"{feature} is disabled by server configuration",
+        "feature": feature,
+    }), 403
+
 @app.errorhandler(404)
 def not_found_error(error):
     return jsonify({"error": "Resource Not Found"}), 404
@@ -56,6 +68,12 @@ def internal_error(error):
 def get_status():
     """一个简单的接口，用于检查后端服务是否正在运行。"""
     return jsonify({"status": "running", "message": "Backend is active!"})
+
+
+@app.route('/api/runtime_config', methods=['GET'])
+def get_runtime_config():
+    return jsonify(build_runtime_config())
+
 
 @app.route('/api/artifact', methods=['GET'])
 def get_artifact():
@@ -768,6 +786,9 @@ def preprocess_data():
     1. 上传文件 (Multipart form data 'files')
     2. 指定本地路径 (JSON body 'raw_dataset_path')
     """
+    if not ENABLE_PREPROCESSING:
+        return _feature_disabled_response("preprocessing")
+
     # Check for JSON input first (Local Path mode)
     if request.is_json:
         data = request.json
@@ -1229,6 +1250,9 @@ def split_dataset(dataset_id):
     if not target_dir.exists():
         return jsonify({"error": "Dataset not found"}), 404
         
+    if not ENABLE_TRAINING:
+        return _feature_disabled_response("training")
+
     config = request.json
     train_ratio = config.get('train_ratio', 0.7)
     val_ratio = config.get('val_ratio', 0.15)
@@ -1418,6 +1442,9 @@ def train_model_api():
     """
     启动模型训练（异步）。
     """
+    if not ENABLE_TRAINING:
+        return _feature_disabled_response("training")
+
     config = request.json
     if not config:
         return jsonify({"error": "Request body must be a JSON with training configuration"}), 400
@@ -1454,6 +1481,7 @@ def train_model_api():
     save_tasks(force=True)
 
     # 启动线程
+    from core.train import run_training_pipeline
     thread = threading.Thread(target=async_task_wrapper, args=(task_id, run_training_pipeline, config))
     thread.start()
 
@@ -1468,6 +1496,9 @@ def run_inference_api():
     """
     Run inference task (asynchronous).
     """
+    if not ENABLE_INFERENCE:
+        return _feature_disabled_response("inference")
+
     config = request.json
     if not config:
         return jsonify({"error": "Request body must be JSON"}), 400

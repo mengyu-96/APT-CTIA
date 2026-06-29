@@ -6,8 +6,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .cache/
+.claude/
 .idea/
 .vscode/
+.DS_Store
 
 uploads/
 dataset_TXT/
@@ -24,6 +26,8 @@ all-MiniLM-L6-v2/
 .env
 .env.*
 !.env.example
+null
+*/null
 
 APT归因复现/
 scripts/

@@ -15,13 +15,14 @@ from apt_ui.pages.features import render_features
 from apt_ui.pages.models import render_models
 from apt_ui.pages.report import render_report
 from apt_ui.pages.upload import render_upload
-from apt_ui.services.api_client import get_dashboard_counts
+from apt_ui.services.api_client import get_dashboard_counts, get_runtime_config
 from apt_ui.services import ui
 
 
 AUTH_QUERY_KEY = "auth"
-AUTH_USERNAME = "admin"
-AUTH_PASSWORD = "admin"
+AUTH_ENABLED = os.getenv("ENABLE_UI_AUTH", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "admin")
 AUTH_SECRET = os.getenv("AUTH_SESSION_SECRET", "rgapt-session-secret")
 
 
@@ -88,6 +89,9 @@ def _set_auth_token(token: str | None) -> None:
 def check_password() -> bool:
     """Returns `True` if the user had a correct password."""
 
+    if not AUTH_ENABLED:
+        return True
+
     def password_entered() -> None:
         if (
             st.session_state["username"] == AUTH_USERNAME
@@ -125,7 +129,8 @@ def check_password() -> bool:
             st.text_input("Username", key="username")
             st.text_input("Password", type="password", key="password")
             st.button("Login", on_click=password_entered, type="primary", width="stretch")
-            st.info("Default: admin / admin")
+            if AUTH_USERNAME == "admin" and AUTH_PASSWORD == "admin":
+                st.info("Default: admin / admin")
 
         return False
 
@@ -172,6 +177,12 @@ FEATURE_MODULES = [
 ]
 
 
+def _feature_modules(training_ui_enabled: bool) -> list[tuple[str, str, str]]:
+    if training_ui_enabled:
+        return FEATURE_MODULES
+    return [item for item in FEATURE_MODULES if item[1] != "模型训练"]
+
+
 def _feature_card(icon: str, title: str, desc: str) -> str:
     return (
         f'<div class="feature-module">'
@@ -192,9 +203,10 @@ def _stat_card(icon: str, value: object, label: str) -> str:
     )
 
 
-def render_home() -> None:
+def render_home(training_ui_enabled: bool) -> None:
+    capability_text = "集成特征提取、模型训练与 APT 归因能力。" if training_ui_enabled else "集成特征提取、APT 归因与报告导出能力。"
     st.markdown(
-        """
+        f"""
         <div style="text-align: center; margin: 1rem 0 2.6rem 0; padding: 2.4rem 1rem;
              background: linear-gradient(160deg, rgba(8,32,52,0.6), rgba(4,20,33,0.4));
              border: 1px solid var(--border-color); border-radius: 16px;">
@@ -206,7 +218,7 @@ def render_home() -> None:
             <p style="color: #00d4ff; opacity: 0.75; letter-spacing: 1.5px; text-transform: uppercase;
                font-size: 0.82rem; margin: 0 0 1.2rem 0;">Semantic-Enhanced APT Threat Graph Attribution System</p>
             <p style="font-size: 1rem; color: var(--text-muted); max-width: 760px; margin: 0 auto; line-height: 1.7;">
-                帮助安全专家快速、准确地识别与分析高级持续性威胁，集成特征提取、模型训练与 APT 归因能力。
+                帮助安全专家快速、准确地识别与分析高级持续性威胁，{capability_text}
             </p>
         </div>
         """,
@@ -214,9 +226,10 @@ def render_home() -> None:
     )
 
     st.markdown('<div class="section-title"><i class="fas fa-th-large"></i><span>核心功能</span></div>', unsafe_allow_html=True)
-    for row_start in range(0, len(FEATURE_MODULES), 4):
+    feature_modules = _feature_modules(training_ui_enabled)
+    for row_start in range(0, len(feature_modules), 4):
         cols = st.columns(4)
-        for col, (icon, title, desc) in zip(cols, FEATURE_MODULES[row_start:row_start + 4]):
+        for col, (icon, title, desc) in zip(cols, feature_modules[row_start:row_start + 4]):
             col.markdown(_feature_card(icon, title, desc), unsafe_allow_html=True)
 
     st.markdown("<div style='height: 1.6rem;'></div>", unsafe_allow_html=True)
@@ -260,6 +273,21 @@ def main() -> None:
     if css_file.exists():
         load_css(css_file)
 
+    runtime_config = get_runtime_config()
+    training_ui_enabled = runtime_config.get("training_ui_enabled", True)
+
+    menu_entries = [
+        ("home", "主页", "house"),
+        ("tasks", "分析任务管理", "list-task"),
+        ("datasets", "数据集管理", "database"),
+        ("features", "特征提取与可视化", "bar-chart"),
+        ("models", "模型管理", "cpu"),
+        ("attribution", "APT归因结果", "bullseye"),
+        ("report", "报告生成与导出", "file-text"),
+    ]
+    if training_ui_enabled:
+        menu_entries.insert(4, ("training", "模型训练", "diagram-3"))
+
     with st.sidebar:
         st.markdown(
             """
@@ -274,26 +302,8 @@ def main() -> None:
 
         selected = option_menu(
             menu_title=None,
-            options=[
-                "主页",
-                "分析任务管理",
-                "数据集管理",
-                "特征提取与可视化",
-                "模型训练",
-                "模型管理",
-                "APT归因结果",
-                "报告生成与导出",
-            ],
-            icons=[
-                "house",
-                "list-task",
-                "database",
-                "bar-chart",
-                "diagram-3",
-                "cpu",
-                "bullseye",
-                "file-text",
-            ],
+            options=[item[1] for item in menu_entries],
+            icons=[item[2] for item in menu_entries],
             menu_icon="cast",
             default_index=0,
             styles={
@@ -323,21 +333,23 @@ def main() -> None:
             if st.button("🗑️ 清空当前会话", type="secondary", width="stretch"):
                 _clear_session()
 
-    if selected == "主页":
-        render_home()
-    elif selected == "分析任务管理":
+    selected_key = next((item[0] for item in menu_entries if item[1] == selected), "home")
+
+    if selected_key == "home":
+        render_home(training_ui_enabled)
+    elif selected_key == "tasks":
         render_upload()
-    elif selected == "特征提取与可视化":
+    elif selected_key == "features":
         render_features()
-    elif selected == "模型训练":
+    elif selected_key == "training":
         render_clustering()
-    elif selected == "APT归因结果":
+    elif selected_key == "attribution":
         render_attribution()
-    elif selected == "数据集管理":
+    elif selected_key == "datasets":
         render_datasets()
-    elif selected == "报告生成与导出":
+    elif selected_key == "report":
         render_report()
-    elif selected == "模型管理":
+    elif selected_key == "models":
         render_models()
 
 

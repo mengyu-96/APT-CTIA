@@ -1,6 +1,6 @@
 import streamlit as st
 import os
-from apt_ui.services.api_client import get_json, request
+from apt_ui.services.api_client import get_json, get_runtime_config, request
 from apt_ui.services.tasks import get_task_detail, list_tasks
 from apt_ui.services import ui
 
@@ -21,8 +21,13 @@ def render_report():
 
 
 def _render_report_config():
+        runtime_config = get_runtime_config()
+        training_source_enabled = runtime_config.get("training_report_source_enabled", True)
         # 1. Select Source Type (Training vs Attribution)
-        source_type = st.radio("数据来源", ["归因任务 (Inference)", "训练任务 (Training)"], horizontal=True)
+        source_options = ["归因任务 (Inference)"]
+        if training_source_enabled:
+            source_options.append("训练任务 (Training)")
+        source_type = st.radio("数据来源", source_options, horizontal=True)
         
         selected_task = None
         task_id = None

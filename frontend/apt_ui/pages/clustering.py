@@ -137,9 +137,13 @@ def _render_result_panel() -> None:
 
 def render_clustering() -> None:
     runtime_config = get_runtime_config()
-    if not runtime_config.get("training_ui_enabled", True):
-        ui.page_header("Model Training", "Disabled In This Deployment", icon="fa-project-diagram")
-        st.info("当前部署已关闭模型训练展示与训练提交能力。")
+    if not runtime_config.get("training_enabled", True):
+        ui.page_header("模型训练", "Server Resource Limited", icon="fa-project-diagram")
+        st.warning("当前服务器算力不足，已关闭在线模型训练功能。")
+        st.markdown(
+            "建议前往 GitHub 本地部署并运行训练流程："
+            " [https://github.com/mengyu-96/APT-CTIA](https://github.com/mengyu-96/APT-CTIA)"
+        )
         return
 
     ui.page_header("模型训练", "Model Training", icon="fa-project-diagram")

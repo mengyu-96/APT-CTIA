@@ -15,7 +15,7 @@ from apt_ui.pages.features import render_features
 from apt_ui.pages.models import render_models
 from apt_ui.pages.report import render_report
 from apt_ui.pages.upload import render_upload
-from apt_ui.services.api_client import get_dashboard_counts, get_runtime_config
+from apt_ui.services.api_client import get_dashboard_counts
 from apt_ui.services import ui
 
 
@@ -177,12 +177,6 @@ FEATURE_MODULES = [
 ]
 
 
-def _feature_modules(training_ui_enabled: bool) -> list[tuple[str, str, str]]:
-    if training_ui_enabled:
-        return FEATURE_MODULES
-    return [item for item in FEATURE_MODULES if item[1] != "模型训练"]
-
-
 def _feature_card(icon: str, title: str, desc: str) -> str:
     return (
         f'<div class="feature-module">'
@@ -203,10 +197,9 @@ def _stat_card(icon: str, value: object, label: str) -> str:
     )
 
 
-def render_home(training_ui_enabled: bool) -> None:
-    capability_text = "集成特征提取、模型训练与 APT 归因能力。" if training_ui_enabled else "集成特征提取、APT 归因与报告导出能力。"
+def render_home() -> None:
     st.markdown(
-        f"""
+        """
         <div style="text-align: center; margin: 1rem 0 2.6rem 0; padding: 2.4rem 1rem;
              background: linear-gradient(160deg, rgba(8,32,52,0.6), rgba(4,20,33,0.4));
              border: 1px solid var(--border-color); border-radius: 16px;">
@@ -218,7 +211,7 @@ def render_home(training_ui_enabled: bool) -> None:
             <p style="color: #00d4ff; opacity: 0.75; letter-spacing: 1.5px; text-transform: uppercase;
                font-size: 0.82rem; margin: 0 0 1.2rem 0;">Semantic-Enhanced APT Threat Graph Attribution System</p>
             <p style="font-size: 1rem; color: var(--text-muted); max-width: 760px; margin: 0 auto; line-height: 1.7;">
-                帮助安全专家快速、准确地识别与分析高级持续性威胁，{capability_text}
+                帮助安全专家快速、准确地识别与分析高级持续性威胁，集成特征提取、模型训练与 APT 归因能力。
             </p>
         </div>
         """,
@@ -226,10 +219,9 @@ def render_home(training_ui_enabled: bool) -> None:
     )
 
     st.markdown('<div class="section-title"><i class="fas fa-th-large"></i><span>核心功能</span></div>', unsafe_allow_html=True)
-    feature_modules = _feature_modules(training_ui_enabled)
-    for row_start in range(0, len(feature_modules), 4):
+    for row_start in range(0, len(FEATURE_MODULES), 4):
         cols = st.columns(4)
-        for col, (icon, title, desc) in zip(cols, feature_modules[row_start:row_start + 4]):
+        for col, (icon, title, desc) in zip(cols, FEATURE_MODULES[row_start:row_start + 4]):
             col.markdown(_feature_card(icon, title, desc), unsafe_allow_html=True)
 
     st.markdown("<div style='height: 1.6rem;'></div>", unsafe_allow_html=True)
@@ -273,20 +265,16 @@ def main() -> None:
     if css_file.exists():
         load_css(css_file)
 
-    runtime_config = get_runtime_config()
-    training_ui_enabled = runtime_config.get("training_ui_enabled", True)
-
     menu_entries = [
         ("home", "主页", "house"),
         ("tasks", "分析任务管理", "list-task"),
         ("datasets", "数据集管理", "database"),
         ("features", "特征提取与可视化", "bar-chart"),
+        ("training", "模型训练", "diagram-3"),
         ("models", "模型管理", "cpu"),
         ("attribution", "APT归因结果", "bullseye"),
         ("report", "报告生成与导出", "file-text"),
     ]
-    if training_ui_enabled:
-        menu_entries.insert(4, ("training", "模型训练", "diagram-3"))
 
     with st.sidebar:
         st.markdown(
@@ -336,7 +324,7 @@ def main() -> None:
     selected_key = next((item[0] for item in menu_entries if item[1] == selected), "home")
 
     if selected_key == "home":
-        render_home(training_ui_enabled)
+        render_home()
     elif selected_key == "tasks":
         render_upload()
     elif selected_key == "features":

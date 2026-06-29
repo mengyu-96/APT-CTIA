@@ -24,6 +24,8 @@ AUTH_ENABLED = os.getenv("ENABLE_UI_AUTH", "true").strip().lower() in {"1", "tru
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
 AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "admin")
 AUTH_SECRET = os.getenv("AUTH_SESSION_SECRET", "rgapt-session-secret")
+SYSTEM_NAME = "GRACE"
+SYSTEM_SUBTITLE = "基于多层异构图与双流学习的APT威胁情报归因系统"
 
 
 @st.cache_data(show_spinner=False)
@@ -118,11 +120,11 @@ def check_password() -> bool:
                     <div style="font-size: 4rem; margin-bottom: 1rem; color: #00d4ff; filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.5));">
                         <i class="fas fa-shield-alt"></i>
                     </div>
-                    <h1 style="color: #00d4ff; letter-spacing: 2px;">RGAPT</h1>
-                    <p style="color: #a0aab5;">Semantic-Enhanced APT Threat Graph Attribution System</p>
-                    <p style="color: #6c757d; font-size: 0.9em;">基于关系感知图注意力网络的 APT 归因分析系统</p>
+                    <h1 style="color: #00d4ff; letter-spacing: 2px;">{SYSTEM_NAME}</h1>
+                    <p style="color: #a0aab5;">{SYSTEM_SUBTITLE}</p>
+                    <p style="color: #6c757d; font-size: 0.9em;">{SYSTEM_SUBTITLE}</p>
                 </div>
-                """,
+                """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
                 unsafe_allow_html=True,
             )
 
@@ -143,11 +145,11 @@ def check_password() -> bool:
                     <div style="font-size: 4rem; margin-bottom: 1rem; color: #00d4ff;">
                         <i class="fas fa-shield-alt"></i>
                     </div>
-                    <h1 style="color: #00d4ff; letter-spacing: 2px;">RGAPT</h1>
-                    <p style="color: #a0aab5;">Semantic-Enhanced APT Threat Graph Attribution System</p>
-                    <p style="color: #6c757d; font-size: 0.9em;">基于关系感知图注意力网络的 APT 归因分析系统</p>
+                    <h1 style="color: #00d4ff; letter-spacing: 2px;">{SYSTEM_NAME}</h1>
+                    <p style="color: #a0aab5;">{SYSTEM_SUBTITLE}</p>
+                    <p style="color: #6c757d; font-size: 0.9em;">{SYSTEM_SUBTITLE}</p>
                 </div>
-                """,
+                """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
                 unsafe_allow_html=True,
             )
 
@@ -168,7 +170,7 @@ def load_css(file_path: Path) -> None:
 FEATURE_MODULES = [
     ("fa-tasks", "任务管理", "分析任务与预处理"),
     ("fa-chart-bar", "特征提取", "多维特征可视化"),
-    ("fa-project-diagram", "模型训练", "关系感知图注意力网络"),
+    ("fa-project-diagram", "模型训练", "多层异构图与双流学习"),
     ("fa-bullseye", "APT 归因", "攻击组织溯源"),
     ("fa-stream", "归因记录", "历史结果与解释证据"),
     ("fa-database", "数据集", "样本数据管理"),
@@ -207,14 +209,14 @@ def render_home() -> None:
                  filter: drop-shadow(0 0 12px rgba(0,212,255,0.4));">
                 <i class="fas fa-shield-alt"></i>
             </div>
-            <h1 style="font-size: 1.7rem; margin: 0 0 0.4rem 0;">基于关系感知图注意力网络的 APT 归因分析系统</h1>
-            <p style="color: #00d4ff; opacity: 0.75; letter-spacing: 1.5px; text-transform: uppercase;
-               font-size: 0.82rem; margin: 0 0 1.2rem 0;">Semantic-Enhanced APT Threat Graph Attribution System</p>
+            <h1 style="font-size: 1.7rem; margin: 0 0 0.4rem 0;">{SYSTEM_NAME}</h1>
+            <p style="color: #00d4ff; opacity: 0.75; letter-spacing: 1.5px;
+               font-size: 0.9rem; margin: 0 0 1.2rem 0;">{SYSTEM_SUBTITLE}</p>
             <p style="font-size: 1rem; color: var(--text-muted); max-width: 760px; margin: 0 auto; line-height: 1.7;">
-                帮助安全专家快速、准确地识别与分析高级持续性威胁，集成特征提取、模型训练与 APT 归因能力。
+                帮助安全专家快速、准确地识别与分析高级持续性威胁，集成特征提取、模型训练与APT威胁情报归因能力。
             </p>
         </div>
-        """,
+        """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
         unsafe_allow_html=True,
     )
 
@@ -247,7 +249,7 @@ def _clear_session() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="APT归因分析系统",
+        page_title=SYSTEM_NAME,
         page_icon="🛡️",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -281,10 +283,10 @@ def main() -> None:
             """
             <div style="text-align: center; margin-bottom: 2rem; padding: 1rem 0;">
                 <div style="font-size: 3rem; margin-bottom: 0.5rem; color: #00d4ff; filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.5));"><i class="fas fa-shield-alt"></i></div>
-                <h2 style="margin:0; color: white; letter-spacing: 2px;">RGAPT</h2>
-                <p style="color: #00d4ff; font-size: 0.8rem; letter-spacing: 1px; opacity: 0.8;">Semantic-Enhanced APT Attribution</p>
+                <h2 style="margin:0; color: white; letter-spacing: 2px;">{SYSTEM_NAME}</h2>
+                <p style="color: #00d4ff; font-size: 0.8rem; letter-spacing: 1px; opacity: 0.8;">{SYSTEM_SUBTITLE}</p>
             </div>
-            """,
+            """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
             unsafe_allow_html=True,
         )
 

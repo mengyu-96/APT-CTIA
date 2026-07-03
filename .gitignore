@@ -1,3 +1,29 @@
 results_archive/
 dataset_TXT/
 uploads/
+
+# Python/runtime cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Local models and generated NLP caches
+all-MiniLM-L6-v2/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Reproduction workdirs: keep source code, exclude local corpora and generated outputs.
+APT归因复现/**/.git/
+APT归因复现/**/__pycache__/
+APT归因复现/**/.cache/
+APT归因复现/**/dataset/
+APT归因复现/**/Dataset/
+APT归因复现/**/data/
+APT归因复现/**/Data/
+APT归因复现/**/Attribution/ckpt/
+APT归因复现/**/Attribution/emb/
+APT归因复现/**/Attribution/log/
+APT归因复现/**/external_knowledge/hf_models/

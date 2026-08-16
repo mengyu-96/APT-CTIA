@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
 
-from apt_ui.services.api_client import invalidate, get_json, request
-from apt_ui.services.charting import PLOTLY_CHART_CONFIG, BRAND_SEQUENCE, apply_layout
-from apt_ui.services.task_ui import render_task_panel
 from apt_ui.services import ui
+from apt_ui.services.api_client import get_binary, get_json, invalidate, request
+from apt_ui.services.charting import BRAND_SEQUENCE, PLOTLY_CHART_CONFIG, apply_layout
+from apt_ui.services.task_ui import render_task_panel
 
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5001")
@@ -50,7 +51,7 @@ def _get_attribution_sample(result_id: str, report_id: str) -> dict | None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _distribution_df(distribution: dict[str, int]) -> pd.DataFrame:
-    return pd.DataFrame(list(distribution.items()), columns=["APT 组织", "数量"])
+    return pd.DataFrame(list(distribution.items()), columns=["APT组织", "数量"])
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -80,6 +81,22 @@ def _delete_result(result_id: str) -> bool:
         return response.status_code == 200
     except Exception:
         return False
+
+
+def _load_report_bytes(report_info: dict) -> bytes | None:
+    report_path = report_info.get("report_path")
+    if report_path:
+        try:
+            local_path = Path(report_path)
+            if local_path.exists() and local_path.is_file():
+                return local_path.read_bytes()
+        except Exception:
+            pass
+
+    download_path = report_info.get("download_path") or report_info.get("report_url")
+    if download_path:
+        return get_binary(download_path, timeout=30)
+    return None
 
 
 def _render_explanation_panel(sample_result: dict) -> None:
@@ -127,8 +144,7 @@ def _render_explanation_panel(sample_result: dict) -> None:
         for item in evidence_paths[:5]:
             st.markdown(f"- `{' -> '.join(item.get('path_texts', []))}`")
 
-    mitre_attack = explanation.get("mitre_attack") or {}
-    techniques = mitre_attack.get("techniques") or []
+    techniques = (explanation.get("mitre_attack") or {}).get("techniques") or []
     if techniques:
         st.markdown("**MITRE ATT&CK 摘要**")
         st.dataframe(pd.DataFrame(techniques), width="stretch", hide_index=True)
@@ -138,12 +154,32 @@ def _inference_task_title(task: dict) -> str:
     return task.get("name") or "归因任务"
 
 
+def _submit_inference(model_id: str, dataset_id: str) -> None:
+    payload = {"model_id": model_id, "dataset_id": dataset_id}
+    try:
+        with st.spinner("正在提交归因任务..."):
+            response = request("POST", "/api/inference", json_body=payload, timeout=(5, 30))
+        if response.status_code == 202:
+            invalidate("tasks")
+            st.session_state[POLL_STATE_KEY] = True
+            st.success(f"任务已提交：{response.json().get('task_id')}")
+            st.rerun()
+        else:
+            st.error(f"提交失败: {response.text}")
+    except requests.exceptions.ReadTimeout:
+        invalidate("tasks")
+        st.session_state[POLL_STATE_KEY] = True
+        st.warning("请求超时，但任务可能已经进入队列。")
+    except Exception as exc:
+        st.error(f"提交异常: {exc}")
+
+
 def _render_task_view() -> None:
     left, right = st.columns([1, 1], gap="large")
 
     with left:
         with ui.section_card("新建归因任务", icon="fa-plus-circle"):
-            st.caption("仅在当前视图加载模型与数据集，避免历史视图产生无效请求。")
+            st.caption("仅在当前视图加载模型与数据集，避免历史视图触发无效请求。")
             with st.form("inference_form"):
                 models = _get_models()
                 model_options = {item["name"]: item["id"] for item in models} if models else {}
@@ -184,24 +220,49 @@ def _render_task_view() -> None:
             )
 
 
-def _submit_inference(model_id: str, dataset_id: str) -> None:
-    payload = {"model_id": model_id, "dataset_id": dataset_id}
-    try:
-        with st.spinner("正在提交归因任务..."):
-            response = request("POST", "/api/inference", json_body=payload, timeout=(5, 30))
-        if response.status_code == 202:
-            invalidate("tasks")
-            st.session_state[POLL_STATE_KEY] = True
-            st.success(f"任务已提交：{response.json().get('task_id')}")
-            st.rerun()
-        else:
-            st.error(f"提交失败: {response.text}")
-    except requests.exceptions.ReadTimeout:
-        invalidate("tasks")
-        st.session_state[POLL_STATE_KEY] = True
-        st.warning("请求超时，但任务可能已经进入队列。")
-    except Exception as exc:
-        st.error(f"提交异常: {exc}")
+def _render_result_report_download(selected_result_id: str, distribution: dict[str, int], total_samples: int) -> None:
+    attrs = [
+        {
+            "name": name,
+            "score": count / total_samples if total_samples else 0.0,
+            "risk": "High" if idx == 0 else "Medium",
+        }
+        for idx, (name, count) in enumerate(
+            sorted(distribution.items(), key=lambda item: item[1], reverse=True)
+        )
+    ]
+    payload = {
+        "task_id": selected_result_id,
+        "analysis_results": {
+            "top_attribution": attrs[0]["name"] if attrs else "Unknown",
+            "attributions": attrs or [{"name": "Unknown", "score": 0.0, "risk": "Low"}],
+            "total_samples": total_samples,
+        },
+    }
+    response = request("POST", "/api/generate_report", json_body=payload, timeout=30)
+    if response.status_code != 200:
+        st.error(f"生成失败: {response.text}")
+        return
+
+    report_info = response.json()
+    pdf_bytes = _load_report_bytes(report_info)
+    st.success("报告生成成功。")
+    if pdf_bytes:
+        st.download_button(
+            "下载 PDF 报告",
+            data=pdf_bytes,
+            file_name=report_info.get("report_name", f"report_{selected_result_id}.pdf"),
+            mime="application/pdf",
+            width="stretch",
+            key=f"download_attr_pdf_{selected_result_id}",
+        )
+        return
+
+    download_path = report_info.get("download_path") or report_info.get("report_url")
+    if download_path:
+        st.link_button("打开 PDF 报告", f"{BACKEND_URL}{download_path}", width="stretch")
+    else:
+        st.warning("报告已生成，但暂时无法获取下载文件。")
 
 
 def _render_history_view() -> None:
@@ -214,7 +275,8 @@ def _render_history_view() -> None:
         st.info("暂无历史归因结果。")
         return
 
-    if "selected_attr_result_id" not in st.session_state or st.session_state["selected_attr_result_id"] not in {item["id"] for item in results}:
+    valid_ids = {item["id"] for item in results}
+    if st.session_state.get("selected_attr_result_id") not in valid_ids:
         st.session_state["selected_attr_result_id"] = results[0]["id"]
 
     st.caption("历史结果仅在当前视图加载；删除或手动刷新后更新。")
@@ -223,10 +285,10 @@ def _render_history_view() -> None:
     with list_col:
         with ui.section_card("结果列表", icon="fa-clock-rotate-left"):
             labels = {
-                f"{item['created']} · {item['total_samples']} 样本": item["id"]
+                f"{item['created']} - {item['total_samples']} 样本": item["id"]
                 for item in results
             }
-            current_id = st.session_state.get("selected_attr_result_id")
+            current_id = st.session_state["selected_attr_result_id"]
             current_label = next((label for label, rid in labels.items() if rid == current_id), next(iter(labels)))
             selected_label = st.radio(
                 "结果列表",
@@ -246,20 +308,20 @@ def _render_history_view() -> None:
         head_col, delete_col = st.columns([4, 1])
         with head_col:
             st.markdown(
-                '<div class="section-title"><i class="fas fa-bullseye"></i>'
-                '<span>归因结果详情</span></div>',
+                '<div class="section-title"><i class="fas fa-bullseye"></i><span>归因结果详情</span></div>',
                 unsafe_allow_html=True,
             )
             st.caption(f"结果 ID: `{selected_result_id}`")
         with delete_col:
-            if st.button(f"🗑️ {ui.ACTION_LABELS['delete']}", key="delete_selected_attr_result", width="stretch"):
+            if st.button(f"{ui.ACTION_LABELS['delete']}", key="delete_selected_attr_result", width="stretch"):
                 if _delete_result(selected_result_id):
                     invalidate("attribution_results")
-                    st.toast("结果已删除", icon="✅")
+                    st.toast("结果已删除", icon="OK")
                     remaining = [item for item in results if item["id"] != selected_result_id]
                     st.session_state["selected_attr_result_id"] = remaining[0]["id"] if remaining else None
                     st.rerun()
-                st.warning("删除失败")
+                else:
+                    st.warning("删除失败。")
 
         distribution = detail.get("label_distribution") or {}
         raw_results = detail.get("results") or []
@@ -277,25 +339,34 @@ def _render_history_view() -> None:
                 fig = px.pie(
                     _distribution_df(distribution),
                     values="数量",
-                    names="APT 组织",
+                    names="APT组织",
                     hole=0.55,
                     color_discrete_sequence=BRAND_SEQUENCE,
                 )
-                # The summary column already lists every group, so the legend is
-                # redundant and only overlapped the chart — hide it and label
-                # slices directly on the donut instead.
                 fig.update_traces(
                     textposition="inside",
                     texttemplate="%{percent}",
                     textfont_size=12,
                     hovertemplate="%{label}<br>%{value} 样本 (%{percent})<extra></extra>",
                 )
-                apply_layout(fig, showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
-                             height=300, uniformtext_minsize=10, uniformtext_mode="hide",
-                             annotations=[dict(
-                                 text=f"<b>{total_samples}</b><br><span style='font-size:11px'>样本</span>",
-                                 x=0.5, y=0.5, font_size=18, font_color="#e6edf3", showarrow=False,
-                             )])
+                apply_layout(
+                    fig,
+                    showlegend=False,
+                    margin=dict(t=10, b=10, l=10, r=10),
+                    height=300,
+                    uniformtext_minsize=10,
+                    uniformtext_mode="hide",
+                    annotations=[
+                        dict(
+                            text=f"<b>{total_samples}</b><br><span style='font-size:11px'>样本</span>",
+                            x=0.5,
+                            y=0.5,
+                            font_size=18,
+                            font_color="#e6edf3",
+                            showarrow=False,
+                        )
+                    ],
+                )
                 st.plotly_chart(fig, width="stretch", config=PLOTLY_CHART_CONFIG)
 
             with summary_col:
@@ -303,7 +374,7 @@ def _render_history_view() -> None:
                 ordered = sorted(distribution.items(), key=lambda item: item[1], reverse=True)
                 for name, count in ordered[:6]:
                     ratio = (count / total_samples) if total_samples else 0.0
-                    st.progress(ratio, text=f"{name} · {count} / {total_samples}")
+                    st.progress(ratio, text=f"{name} - {count} / {total_samples}")
                 if len(ordered) > 6:
                     st.caption(f"另有 {len(ordered) - 6} 个组织未列出。")
 
@@ -337,43 +408,18 @@ def _render_history_view() -> None:
                 st.download_button(
                     "导出 CSV",
                     csv_bytes,
-                    "attribution_results.csv",
+                    f"attribution_results_{selected_result_id}.csv",
                     "text/csv",
                     width="stretch",
                 )
             with report_col:
                 if st.button("PDF 报告", width="stretch", key="generate_attr_pdf"):
                     with st.spinner("正在生成报告..."):
-                        attrs = [
-                            {
-                                "name": name,
-                                "score": count / total_samples if total_samples else 0.0,
-                                "risk": "High" if idx == 0 else "Medium",
-                            }
-                            for idx, (name, count) in enumerate(
-                                sorted(distribution.items(), key=lambda item: item[1], reverse=True)
-                            )
-                        ]
-                        payload = {
-                            "task_id": selected_result_id,
-                            "analysis_results": {
-                                "top_attribution": attrs[0]["name"] if attrs else "Unknown",
-                                "attributions": attrs or [{"name": "Unknown", "score": 0.0, "risk": "Low"}],
-                                "total_samples": total_samples,
-                            },
-                        }
-                        response = request("POST", "/api/generate_report", json_body=payload, timeout=30)
-                        if response.status_code == 200:
-                            report_info = response.json()
-                            report_url = f"{BACKEND_URL}{report_info['report_url']}"
-                            st.success("报告生成成功。")
-                            st.markdown(f"[打开 PDF 报告]({report_url})")
-                        else:
-                            st.error(f"生成失败: {response.text}")
+                        _render_result_report_download(selected_result_id, distribution, total_samples)
 
             if selected_sample_id is not None:
                 with st.expander("解释证据详情", expanded=True):
-                    with st.spinner("正在加载该样本的解释证据…"):
+                    with st.spinner("正在加载该样本的解释证据..."):
                         selected_sample = _get_attribution_sample(selected_result_id, selected_sample_id)
                     if selected_sample:
                         _render_explanation_panel(selected_sample)

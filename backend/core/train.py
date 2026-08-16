@@ -1517,6 +1517,26 @@ def _autocast_context(device: torch.device, enabled: bool):
     return autocast(enabled=True)
 
 
+def _compute_loss(criterion, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    weight = getattr(criterion, 'weight', None)
+    if (
+        isinstance(weight, torch.Tensor)
+        and logits.is_floating_point()
+        and logits.dtype != weight.dtype
+    ):
+        logits = logits.to(dtype=weight.dtype)
+    return criterion(logits, targets)
+
+
+def _artifact_result_path(path_value: Optional[Path]) -> Optional[str]:
+    if path_value is None:
+        return None
+    try:
+        return str(path_value.resolve().relative_to(_REPO_ROOT.resolve())).replace("\\", "/")
+    except Exception:
+        return str(path_value)
+
+
 def train_epoch(
     model,
     train_loader,
@@ -1547,7 +1567,7 @@ def train_epoch(
             else:
                 out = model(batch.x, batch.edge_index, batch.batch)
 
-            loss = criterion(out, batch.y)
+            loss = _compute_loss(criterion, out, batch.y)
 
         step_loss = loss / accumulation_steps
         if scaler is not None:
@@ -1598,7 +1618,7 @@ def validate(model, val_loader, criterion, device):
                 else:
                     out = model(batch.x, batch.edge_index, batch.batch)
 
-            loss = criterion(out, batch.y)
+                loss = _compute_loss(criterion, out, batch.y)
             total_loss += loss.item()
             
             pred = out.argmax(dim=1)
@@ -2433,7 +2453,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
             for _ in range(2):
                 _doc = sample_batch.doc_emb if hasattr(sample_batch, 'doc_emb') else None
                 _o = eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch, doc_emb=_doc) if isinstance(eval_model, APTAttributionGraphSAGE) else eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch)
-                _loss = criterion(_o, sample_batch.y)
+                _loss = _compute_loss(criterion, _o, sample_batch.y)
                 _loss.backward()
             for _ in range(5):
                 ft = CudaTimer(device)
@@ -2445,7 +2465,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
                 bt = CudaTimer(device)
                 bt.start()
-                _loss = criterion(_o, sample_batch.y)
+                _loss = _compute_loss(criterion, _o, sample_batch.y)
                 _loss.backward()
                 b_ms = bt.stop()
                 time_logger.add_backward_ms(b_ms)
@@ -2509,14 +2529,14 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         'test_f1_weighted': test_w_f1,
         'metrics': metrics,
         'config': config,
-        'model_path': str(best_model_path),
-        'time_log_path': str(time_log_path),
+        'model_path': _artifact_result_path(best_model_path),
+        'time_log_path': _artifact_result_path(time_log_path),
         'temperature': round(float(temperature), 6),
-        'topk_predictions_path': str(topk_path) if topk_path.exists() else None,
-        'gate_summary_path': str(gate_summary_path) if gate_summary_path.exists() else None,
+        'topk_predictions_path': _artifact_result_path(topk_path) if topk_path.exists() else None,
+        'gate_summary_path': _artifact_result_path(gate_summary_path) if gate_summary_path.exists() else None,
         'gate_summary': gate_summary,
-        'history_plot': str(history_plot_path) if history_plot_path.exists() else None,
-        'confusion_matrix_plot': str(cm_plot_path) if cm_plot_path.exists() else None,
+        'history_plot': _artifact_result_path(history_plot_path) if history_plot_path.exists() else None,
+        'confusion_matrix_plot': _artifact_result_path(cm_plot_path) if cm_plot_path.exists() else None,
         'classification_report': cls_report,
         'history': history,
     }

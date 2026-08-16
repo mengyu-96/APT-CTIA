@@ -173,6 +173,17 @@ def get_artifact_bytes(path: str, *, timeout: float = 5) -> bytes | None:
     return _get_bytes("/api/artifact", _normalise_params({"path": path}), timeout)
 
 
+def get_binary(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: float = 30,
+) -> bytes | None:
+    if not path:
+        return None
+    return _get_bytes(path, _normalise_params(params), timeout)
+
+
 def request(
     method: str,
     path: str,

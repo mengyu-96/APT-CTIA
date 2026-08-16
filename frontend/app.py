@@ -122,17 +122,17 @@ def check_password() -> bool:
                     </div>
                     <h1 style="color: #00d4ff; letter-spacing: 2px;">{SYSTEM_NAME}</h1>
                     <p style="color: #a0aab5;">{SYSTEM_SUBTITLE}</p>
-                    <p style="color: #6c757d; font-size: 0.9em;">{SYSTEM_SUBTITLE}</p>
+                    <p style="color: #a0aab5; font-size: 0.95em; line-height: 1.5;">{SYSTEM_SUBTITLE_EN}</p>
                 </div>
-                """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
+                """.format(SYSTEM_NAME=SYSTEM_NAME,SYSTEM_SUBTITLE=SYSTEM_SUBTITLE, SYSTEM_SUBTITLE_EN="Graph-based APT Cyber Threat IntElligence Attribution System Based on Multi-layer Heterogeneous Graph and Dual-stream Learning"),
                 unsafe_allow_html=True,
             )
 
             st.text_input("Username", key="username")
             st.text_input("Password", type="password", key="password")
             st.button("Login", on_click=password_entered, type="primary", width="stretch")
-            if AUTH_USERNAME == "admin" and AUTH_PASSWORD == "admin":
-                st.info("Default: admin / admin")
+            #if AUTH_USERNAME == "admin" and AUTH_PASSWORD == "admin":
+                #st.info("Default: admin / admin")
 
         return False
 
@@ -269,7 +269,7 @@ def main() -> None:
 
     menu_entries = [
         ("home", "主页", "house"),
-        ("tasks", "分析任务管理", "list-task"),
+        ("tasks", "预处理任务管理", "list-task"),
         ("datasets", "数据集管理", "database"),
         ("features", "特征提取与可视化", "bar-chart"),
         ("training", "模型训练", "diagram-3"),

@@ -1,6 +1,6 @@
 # backend/api.py
 from flask import Flask, request, jsonify, send_file, abort
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import os
 import shutil
 import datetime
@@ -82,17 +82,10 @@ def get_artifact():
         return jsonify({"error": "Missing path"}), 400
 
     try:
-        p = Path(raw_path)
-        if not p.is_absolute():
-            p = (BASE_DIR / p)
-        resolved = p.resolve()
+        resolved = _resolve_artifact_path(raw_path)
     except Exception:
         return jsonify({"error": "Invalid path"}), 400
-
-    archive_root = RESULTS_ARCHIVE.resolve()
-    try:
-        resolved.relative_to(archive_root)
-    except Exception:
+    if resolved is None:
         abort(403)
 
     if not resolved.exists() or not resolved.is_file():
@@ -140,6 +133,161 @@ _FILE_JSON_CACHE: dict[str, tuple[tuple[float, int], Any]] = {}
 _FILE_JSON_CACHE_LOCK = threading.Lock()
 _DIR_PAYLOAD_CACHE: dict[str, tuple[Any, Any]] = {}
 _DIR_PAYLOAD_CACHE_LOCK = threading.Lock()
+_TRAIN_ARTIFACT_FIELDS = (
+    "model_path",
+    "time_log_path",
+    "topk_predictions_path",
+    "gate_summary_path",
+    "history_plot",
+    "confusion_matrix_plot",
+)
+
+
+def _extract_results_archive_relative(raw_path: str) -> Path | None:
+    if not isinstance(raw_path, str):
+        return None
+    normalized = raw_path.strip().replace("\\", "/")
+    if not normalized:
+        return None
+
+    parts = [part for part in PurePosixPath(normalized).parts if part not in {"", "/"}]
+    lower_parts = [part.lower() for part in parts]
+    if "results_archive" in lower_parts:
+        idx = lower_parts.index("results_archive")
+        return Path("results_archive", *parts[idx + 1 :])
+    return None
+
+
+def _is_windows_absolute_path(raw_path: str) -> bool:
+    if not isinstance(raw_path, str):
+        return False
+    try:
+        return PureWindowsPath(raw_path.strip()).is_absolute()
+    except Exception:
+        return False
+
+
+def _is_posix_absolute_path(raw_path: str) -> bool:
+    if not isinstance(raw_path, str):
+        return False
+    try:
+        return PurePosixPath(raw_path.strip().replace("\\", "/")).is_absolute()
+    except Exception:
+        return False
+
+
+def _normalized_relative_path(raw_path: str) -> Path:
+    normalized = raw_path.strip().replace("\\", "/")
+    parts = [part for part in PurePosixPath(normalized).parts if part not in {"", "/"}]
+    return Path(*parts) if parts else Path()
+
+
+def _is_foreign_absolute_path(raw_path: str) -> bool:
+    if os.name == 'nt':
+        return _is_posix_absolute_path(raw_path) and not _is_windows_absolute_path(raw_path)
+    return _is_windows_absolute_path(raw_path) and not _is_posix_absolute_path(raw_path)
+
+
+def _to_repo_relative_path(path_value: Any) -> Any:
+    if not isinstance(path_value, str) or not path_value.strip():
+        return path_value
+    stripped = path_value.strip()
+
+    rel_from_archive = _extract_results_archive_relative(stripped)
+    if rel_from_archive is not None:
+        return str(rel_from_archive).replace("\\", "/")
+
+    if _is_foreign_absolute_path(stripped):
+        return stripped.replace("\\", "/")
+
+    try:
+        path_obj = Path(stripped)
+        if not path_obj.is_absolute():
+            return stripped.replace("\\", "/")
+        resolved = path_obj.resolve()
+        return str(resolved.relative_to(BASE_DIR.resolve())).replace("\\", "/")
+    except Exception:
+        return stripped.replace("\\", "/")
+
+
+def _resolve_repo_managed_path(raw_path: str) -> Path | None:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+
+    stripped = raw_path.strip()
+    rel_from_archive = _extract_results_archive_relative(stripped)
+    if rel_from_archive is not None:
+        return (BASE_DIR / rel_from_archive).resolve()
+
+    if _is_foreign_absolute_path(stripped):
+        return None
+
+    path_obj = Path(stripped)
+    if path_obj.is_absolute():
+        return path_obj.resolve()
+
+    normalized_rel = _normalized_relative_path(stripped)
+    if not normalized_rel.parts:
+        return None
+    return (BASE_DIR / normalized_rel).resolve()
+
+
+def _normalize_result_ref(ref: Any) -> Any:
+    if not isinstance(ref, dict):
+        return ref
+
+    normalized = dict(ref)
+    normalized["path"] = _to_repo_relative_path(normalized.get("path"))
+    return normalized
+
+
+def _normalize_train_artifact_paths(result: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+
+    normalized = dict(result)
+    for field in _TRAIN_ARTIFACT_FIELDS:
+        normalized[field] = _to_repo_relative_path(normalized.get(field))
+    return normalized
+
+
+def _resolve_artifact_path(raw_path: str) -> Path | None:
+    archive_root = RESULTS_ARCHIVE.resolve()
+    candidates: list[Path] = []
+    stripped = raw_path.strip()
+    normalized_rel = _normalized_relative_path(stripped)
+
+    rel_from_archive = _extract_results_archive_relative(raw_path)
+    if rel_from_archive is not None:
+        candidates.append(BASE_DIR / rel_from_archive)
+
+    if _is_foreign_absolute_path(stripped):
+        pass
+    else:
+        path_obj = Path(stripped)
+        if path_obj.is_absolute():
+            candidates.append(path_obj)
+        else:
+            candidates.append(BASE_DIR / normalized_rel)
+            candidates.append(RESULTS_ARCHIVE / normalized_rel)
+
+    if not _is_windows_absolute_path(stripped) and not _is_posix_absolute_path(stripped):
+        candidates.append(BASE_DIR / normalized_rel)
+        candidates.append(RESULTS_ARCHIVE / normalized_rel)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(archive_root)
+            return resolved
+        except Exception:
+            continue
+    return None
 
 
 def _read_json_cached(path: Path) -> Any:
@@ -208,7 +356,9 @@ def _build_result_ref(task_type: str, result: Any, task: dict[str, Any]) -> dict
     if task_type == 'train':
         model_path = result.get('model_path')
         if model_path:
-            return {"kind": "train_run", "path": str(Path(model_path).resolve().parent)}
+            resolved_model_path = _resolve_repo_managed_path(model_path)
+            if resolved_model_path is not None:
+                return {"kind": "train_run", "path": _to_repo_relative_path(str(resolved_model_path.parent))}
 
     if task_type == 'inference':
         output_dir = result.get('output_dir') or task.get('output_dir')
@@ -217,12 +367,16 @@ def _build_result_ref(task_type: str, result: Any, task: dict[str, Any]) -> dict
             if found_dir:
                 output_dir = str(found_dir)
         if output_dir:
-            return {"kind": "inference_run", "path": str(Path(output_dir).resolve())}
+            resolved_output_dir = _resolve_repo_managed_path(output_dir)
+            if resolved_output_dir is not None:
+                return {"kind": "inference_run", "path": _to_repo_relative_path(str(resolved_output_dir))}
 
     if task_type == 'preprocess':
         output_path = result.get('output_path') or task.get('output_dir')
         if output_path:
-            return {"kind": "preprocess_run", "path": str(Path(output_path).resolve())}
+            resolved_output_path = _resolve_repo_managed_path(output_path)
+            if resolved_output_path is not None:
+                return {"kind": "preprocess_run", "path": _to_repo_relative_path(str(resolved_output_path))}
 
     return None
 
@@ -232,6 +386,7 @@ def _summarize_task_result(task_type: str, result: Any, task: dict[str, Any]) ->
         return result
 
     if task_type == 'train':
+        result = _normalize_train_artifact_paths(result)
         return {
             "test_accuracy": result.get("test_accuracy", 0.0),
             "test_f1_weighted": result.get("test_f1_weighted", 0.0),
@@ -259,7 +414,7 @@ def _summarize_task_result(task_type: str, result: Any, task: dict[str, Any]) ->
 
 
 def _load_task_result(task: dict[str, Any]) -> Any:
-    ref = task.get('result_ref') or {}
+    ref = _normalize_result_ref(task.get('result_ref') or {})
     if not ref:
         return task.get('result_summary')
 
@@ -268,10 +423,13 @@ def _load_task_result(task: dict[str, Any]) -> Any:
     if not path_str:
         return task.get('result_summary')
 
-    path = Path(path_str)
+    path = _resolve_repo_managed_path(path_str)
+    if path is None:
+        return task.get('result_summary')
+
     if kind == 'train_run':
         results = _read_json_file(path / 'results.json')
-        return results if isinstance(results, dict) else task.get('result_summary')
+        return _normalize_train_artifact_paths(results) if isinstance(results, dict) else task.get('result_summary')
 
     if kind == 'inference_run':
         results = _read_json_file(path / 'inference_results.json')
@@ -301,10 +459,16 @@ def _normalize_task_record(task_id: str, task: dict[str, Any]) -> bool:
             task['result_ref'] = result_ref
         changed = True
 
+    existing_ref = task.get('result_ref')
+    normalized_ref = _normalize_result_ref(existing_ref)
+    if normalized_ref != existing_ref:
+        task['result_ref'] = normalized_ref
+        changed = True
+
     if task.get('type') == 'inference' and not task.get('result_ref'):
         result_dir = _find_inference_result_dir(task_id)
         if result_dir:
-            task['result_ref'] = {"kind": "inference_run", "path": str(result_dir.resolve())}
+            task['result_ref'] = {"kind": "inference_run", "path": _to_repo_relative_path(str(result_dir.resolve()))}
             task.setdefault('output_dir', str(result_dir.resolve()))
             changed = True
 
@@ -350,7 +514,10 @@ def _task_list_item(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
 def _task_detail_payload(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
     payload = dict(task)
     payload['id'] = task_id
-    payload['result'] = _load_task_result(task)
+    result = _load_task_result(task)
+    if task.get('type') == 'train':
+        result = _normalize_train_artifact_paths(result)
+    payload['result'] = result
     return payload
 
 
@@ -1830,6 +1997,8 @@ def generate_report():
             reverse=True
         )
         if sample_results:
+            analysis_results['result_records'] = inf_res.get('results', [])
+            analysis_results['label_distribution'] = analysis_results.get('label_distribution') or dist
             analysis_results['sample_explanations'] = sample_results[:3]
             analysis_results['explanation'] = analysis_results.get('explanation') or sample_results[0].get('explanation', {})
             analysis_results['graph_data'] = analysis_results.get('graph_data') or sample_results[0].get('graph_data')
@@ -1849,20 +2018,23 @@ def generate_report():
         
         return jsonify({
             "message": "Report generated successfully",
-            "report_url": f"/reports/{output_filename}", # Frontend should prepend API URL if needed, or use relative
-            "report_path": str(report_path)
+            "report_name": output_filename,
+            "report_path": str(report_path),
+            "download_path": f"/api/reports/{output_filename}",
+            "report_url": f"/api/reports/{output_filename}",
         })
     except Exception as e:
         logging.error(f"Report generation failed: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/reports/<filename>', methods=['GET'])
 @app.route('/reports/<filename>', methods=['GET'])
 def download_report(filename):
     """
     下载报告文件。
     """
     from flask import send_from_directory
-    return send_from_directory(REPORTS_DIR, filename)
+    return send_from_directory(REPORTS_DIR, filename, as_attachment=True, download_name=filename)
 
 @app.route('/api/gangs', methods=['GET'])
 def get_gangs():

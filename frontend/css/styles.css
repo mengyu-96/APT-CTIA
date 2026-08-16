@@ -223,6 +223,17 @@ button[kind="primary"]:hover, button[data-testid="baseButton-primary"]:hover {
 .section-title i { color: var(--primary-color); }
 
 /* ---------- Feature modules (home) ---------- */
+.feature-module-link {
+    display: block;
+    text-decoration: none !important;
+    color: inherit !important;
+}
+.feature-module-link:hover,
+.feature-module-link:focus,
+.feature-module-link:visited {
+    text-decoration: none !important;
+    color: inherit !important;
+}
 .feature-module {
     background: linear-gradient(155deg, rgba(8, 32, 52, 0.9), rgba(4, 20, 33, 0.95));
     border: 1px solid var(--border-color);
@@ -251,6 +262,7 @@ button[kind="primary"]:hover, button[data-testid="baseButton-primary"]:hover {
     color: #ffffff !important; margin: 0;
 }
 .feature-module p { color: var(--text-muted); font-size: 0.82rem; margin: 0; }
+
 
 /* ---------- Stat cards ---------- */
 .stat-card {

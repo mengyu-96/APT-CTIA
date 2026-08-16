@@ -32,3 +32,6 @@ null
 APT归因复现/
 scripts/
 docs/generated/
+backend/venv/
+frontend/streamlit.log
+*.log

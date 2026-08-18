@@ -20,6 +20,14 @@ VIEW_STATE_KEY = "attribution_page_view"
 
 TASK_VIEW_LABEL = "新建归因任务"
 HISTORY_VIEW_LABEL = "历史归因结果"
+MODEL_DISPLAY_NAMES = {
+    "RGAT": "GRACE",
+    "GAT": "APT-ATT",
+    "Hybrid": "APT-MMF",
+    "GCN": "MLDSJ",
+    "Transformer": "Mead",
+    "GraphSAGE": "TRAIL",
+}
 
 
 def _get_models() -> list[dict]:
@@ -182,7 +190,10 @@ def _render_task_view() -> None:
             st.caption("仅在当前视图加载模型与数据集，避免历史视图触发无效请求。")
             with st.form("inference_form"):
                 models = _get_models()
-                model_options = {item["name"]: item["id"] for item in models} if models else {}
+                model_options = {
+                    MODEL_DISPLAY_NAMES.get(item.get("type"), item["name"]): item["id"]
+                    for item in models
+                } if models else {}
                 if model_options:
                     selected_model_name = st.selectbox("选择模型", list(model_options.keys()))
                     selected_model_id = model_options[selected_model_name]

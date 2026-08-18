@@ -20,6 +20,14 @@ from apt_ui.services import ui
 
 POLL_STATE_KEY = "training_polling_active"
 RESULT_STATE_KEY = "current_model_result"
+MODEL_DISPLAY_NAMES = {
+    "RGAT": "GRACE",
+    "GAT": "APT-ATT",
+    "Hybrid": "APT-MMF",
+    "GCN": "MLDSJ",
+    "Transformer": "Mead",
+    "GraphSAGE": "TRAIL",
+}
 
 
 def _get_datasets() -> list[dict]:
@@ -31,7 +39,8 @@ def _load_artifact_image(path: str) -> bytes | None:
 
 
 def _train_task_title(task: dict) -> str:
-    return task.get("model") or task.get("name") or "训练任务"
+    model = task.get("model")
+    return MODEL_DISPLAY_NAMES.get(model, model) or task.get("name") or "训练任务"
 
 
 def _train_task_subtitle(task: dict) -> str:
@@ -99,7 +108,12 @@ def _render_result_panel() -> None:
         st.rerun()
 
     with st.expander("训练配置", expanded=False):
-        st.json(result.get("config") or {})
+        config = dict(result.get("config") or {})
+        if config.get("model_type"):
+            config["model_type"] = MODEL_DISPLAY_NAMES.get(
+                config["model_type"], config["model_type"]
+            )
+        st.json(config)
 
     history = result.get("history") or {}
     if history:
@@ -179,11 +193,20 @@ def render_clustering() -> None:
                     dataset_name = st.selectbox("选择数据集", list(dataset_options.keys()))
                     selected_dataset = dataset_options[dataset_name]
 
-                algorithm = st.selectbox(
+                model_architectures = {
+                    "GRACE": "RGAT",
+                    "APT-ATT": "GAT",
+                    "APT-MMF": "Hybrid",
+                    "MLDSJ": "GCN",
+                    "Mead": "Transformer",
+                    "TRAIL": "GraphSAGE",
+                }
+                algorithm_label = st.selectbox(
                     "模型架构",
-                    ["GAT", "RGAT", "GCN", "GraphSAGE", "Transformer", "GIN", "Hybrid"],
+                    list(model_architectures),
                     index=0,
                 )
+                algorithm = model_architectures[algorithm_label]
 
                 use_temporal = False
                 temporal_hidden = 128

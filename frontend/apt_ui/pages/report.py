@@ -11,6 +11,14 @@ from apt_ui.services.tasks import get_task_detail, list_tasks
 
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5001")
+MODEL_DISPLAY_NAMES = {
+    "RGAT": "GRACE",
+    "GAT": "APT-ATT",
+    "Hybrid": "APT-MMF",
+    "GCN": "MLDSJ",
+    "Transformer": "Mead",
+    "GraphSAGE": "TRAIL",
+}
 
 
 def render_report() -> None:
@@ -60,7 +68,7 @@ def _render_report_config() -> None:
         ]
         if completed_tasks:
             options = {
-                f"{task['id'][:8]} - {task['model']} ({task['dataset']})": task
+                f"{task['id'][:8]} - {MODEL_DISPLAY_NAMES.get(task.get('model'), task.get('model', 'Unknown'))} ({task['dataset']})": task
                 for task in completed_tasks
             }
             selected_label = st.selectbox("选择训练任务", options=list(options.keys()))
@@ -74,7 +82,7 @@ def _render_report_config() -> None:
         task_id = st.text_input("或手动输入任务/结果 ID", value="").strip()
 
     st.selectbox("报告类型", ["完整归因报告", "技术细节报告", "高管摘要"], index=0)
-    st.radio("导出格式", ["PDF", "HTML (即将支持)", "JSON (即将支持)"], index=0)
+    st.caption("导出格式：PDF")
     st.multiselect(
         "包含章节",
         ["执行摘要", "样本分析", "特征提取结果", "模型训练图谱", "归因结论", "IOCs"],

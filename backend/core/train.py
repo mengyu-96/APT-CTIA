@@ -13,6 +13,7 @@ import copy
 import hashlib
 import math
 import re
+import shutil
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import lru_cache
@@ -572,6 +573,23 @@ def load_graph_dataset(dataset_path: Path, label_mapping_path: Optional[Path] = 
 
     _normalize_graph_dict_metadata_for_batch(graphs)
 
+    expected_feature_dim = int(graphs[0].x.size(1))
+    for graph_index, graph in enumerate(graphs):
+        report_id = getattr(graph, "report_id", f"graph[{graph_index}]")
+        if graph.x.ndim != 2 or int(graph.x.size(1)) != expected_feature_dim:
+            raise RuntimeError(
+                f"Feature dimension drift in {report_id}: expected {expected_feature_dim}, "
+                f"got {tuple(graph.x.shape)}. Rebuild the complete dataset before training."
+            )
+        if graph.x.size(0) == 0 or not torch.isfinite(graph.x).all():
+            raise RuntimeError(f"Invalid node features in {report_id}: empty graph or NaN/Inf values.")
+        if graph.edge_index.ndim != 2 or graph.edge_index.size(0) != 2:
+            raise RuntimeError(f"Invalid edge_index shape in {report_id}: {tuple(graph.edge_index.shape)}")
+        if graph.edge_index.numel() and (
+            int(graph.edge_index.min()) < 0 or int(graph.edge_index.max()) >= int(graph.x.size(0))
+        ):
+            raise RuntimeError(f"Out-of-range edge index in {report_id}.")
+
     label_to_idx = {}
     if label_mapping_path and label_mapping_path.exists():
         LOGGER.info("加载标签映射: %s", label_mapping_path)
@@ -599,6 +617,51 @@ def load_graph_dataset(dataset_path: Path, label_mapping_path: Optional[Path] = 
 
 def _clone_graph(graph: Data) -> Data:
     return copy.deepcopy(graph)
+
+
+_EDGE_RELATION_NAMES = {
+    0: "local_cooccurrence",
+    1: "report_anchor",
+    2: "self_evidence",
+    3: "behavior_evidence",
+    4: "malware_artifact",
+    5: "operation_campaign",
+    6: "entity_context",
+}
+
+
+def _refresh_edge_relations(graph: Data) -> Data:
+    """Recompute relation ids after graph-variant transforms change edges."""
+    edge_index = graph.edge_index
+    edge_count = int(edge_index.size(1)) if edge_index is not None else 0
+    labels = [str(value).upper() for value in list(getattr(graph, "node_labels", []) or [])]
+    artifact_labels = {
+        "MALWARE", "TOOL", "FILE_NAME", "FILE_PATH", "HASH", "HASH_MD5",
+        "HASH_SHA1", "HASH_SHA256", "URL", "DOMAIN", "IP", "HOSTNAME",
+        "PORT", "EMAIL", "SSL_CERT", "PROCESS", "SERVICE", "REGISTRY",
+    }
+
+    relation_ids: List[int] = []
+    for source, target in edge_index.t().tolist() if edge_count else []:
+        src = labels[source] if 0 <= source < len(labels) else "UNKNOWN"
+        dst = labels[target] if 0 <= target < len(labels) else "UNKNOWN"
+        if src == "REPORT" or dst == "REPORT":
+            relation_id = 1
+        elif source == target:
+            relation_id = 2
+        elif "MITRE_TECH" in (src, dst):
+            relation_id = 3
+        elif src in artifact_labels or dst in artifact_labels:
+            relation_id = 4
+        elif src in {"OPERATION", "CAMPAIGN"} or dst in {"OPERATION", "CAMPAIGN"}:
+            relation_id = 5
+        else:
+            relation_id = 6
+        relation_ids.append(relation_id)
+
+    graph.edge_type = torch.tensor(relation_ids, dtype=torch.long, device=edge_index.device)
+    graph.edge_relation_names = [_EDGE_RELATION_NAMES[value] for value in relation_ids]
+    return graph
 
 
 def _find_report_node_index(graph: Data) -> Optional[int]:
@@ -1359,11 +1422,13 @@ def transform_graphs_for_variant(
     if variant in {'default'}:
         return graphs
     transformed = [
-        transform_graph_for_variant(
-            graph,
-            variant,
-            processed_data_path=processed_data_path,
-            strict_repro=strict_repro,
+        _refresh_edge_relations(
+            transform_graph_for_variant(
+                graph,
+                variant,
+                processed_data_path=processed_data_path,
+                strict_repro=strict_repro,
+            )
         )
         for graph in graphs
     ]
@@ -1564,10 +1629,18 @@ def train_epoch(
         with _autocast_context(device, enabled=(use_amp and device.type == 'cuda')):
             if isinstance(model, APTAttributionGraphSAGE):
                 out = model(batch.x, batch.edge_index, batch.batch, doc_emb=doc_emb)
+            elif RelationAwareGAT is not None and isinstance(model, RelationAwareGAT):
+                out = model(batch.x, batch.edge_index, batch.batch, getattr(batch, "edge_type", None))
             else:
                 out = model(batch.x, batch.edge_index, batch.batch)
 
             loss = _compute_loss(criterion, out, batch.y)
+            auxiliary_loss_fn = getattr(model, "auxiliary_regularization_loss", None)
+            if callable(auxiliary_loss_fn):
+                # Small enough to preserve the classification objective while
+                # preventing either RGAT branch and the explanation pooling
+                # distribution from collapsing during late-stage fitting.
+                loss = loss + 0.10 * auxiliary_loss_fn()
 
         step_loss = loss / accumulation_steps
         if scaler is not None:
@@ -1615,6 +1688,8 @@ def validate(model, val_loader, criterion, device):
             with _autocast_context(device, enabled=(device.type == 'cuda')):
                 if isinstance(model, APTAttributionGraphSAGE):
                     out = model(batch.x, batch.edge_index, batch.batch, doc_emb=doc_emb)
+                elif RelationAwareGAT is not None and isinstance(model, RelationAwareGAT):
+                    out = model(batch.x, batch.edge_index, batch.batch, getattr(batch, "edge_type", None))
                 else:
                     out = model(batch.x, batch.edge_index, batch.batch)
 
@@ -1635,6 +1710,8 @@ def _forward_model(model, batch):
     doc_emb = batch.doc_emb if hasattr(batch, 'doc_emb') else None
     if isinstance(model, APTAttributionGraphSAGE):
         return model(batch.x, batch.edge_index, batch.batch, doc_emb=doc_emb)
+    if RelationAwareGAT is not None and isinstance(model, RelationAwareGAT):
+        return model(batch.x, batch.edge_index, batch.batch, getattr(batch, "edge_type", None))
     return model(batch.x, batch.edge_index, batch.batch)
 
 
@@ -1763,7 +1840,7 @@ def _summarize_rgat_gate_attention(model, loader, device: torch.device, output_p
         for batch in loader:
             batch = batch.to(device)
             try:
-                _, att = model(batch.x, batch.edge_index, batch.batch, return_attention=True)
+                _, att = model(batch.x, batch.edge_index, batch.batch, getattr(batch, "edge_type", None), return_attention=True)
             except TypeError:
                 return None
             if not isinstance(att, dict):
@@ -1969,9 +2046,11 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     focal_gamma = float(config.get('focal_gamma', 2.0))
     use_temperature_calibration = bool(config.get('use_temperature_calibration', True))
     min_class_samples = int(config.get('min_class_samples', 1) or 1)
-    enable_micro_benchmark = bool(config.get('enable_micro_benchmark', True))
-    enable_flops = bool(config.get('enable_flops', True))
-    inference_benchmark_samples = int(config.get('inference_benchmark_samples', 100) or 0)
+    run_post_training_benchmarks = bool(config.get('run_post_training_benchmarks', False))
+    enable_micro_benchmark = bool(config.get('enable_micro_benchmark', run_post_training_benchmarks))
+    enable_flops = bool(config.get('enable_flops', run_post_training_benchmarks))
+    default_inference_samples = 10 if run_post_training_benchmarks else 0
+    inference_benchmark_samples = int(config.get('inference_benchmark_samples', default_inference_samples) or 0)
     epochs = int(config.get('epochs', 100))
     lr = float(config.get('lr', 0.001))
     batch_size = int(config.get('batch_size', 32))
@@ -2009,6 +2088,11 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         run_output_dir = base_output_dir / f'{model_type}_{timestamp}_seed{seed}'
     run_output_dir.mkdir(parents=True, exist_ok=True)
+    feature_manifest_path = processed_data_path / "feature_manifest.json"
+    if feature_manifest_path.exists():
+        shutil.copy2(feature_manifest_path, run_output_dir / "feature_manifest.json")
+    else:
+        LOGGER.warning("Feature manifest missing for training dataset: %s", processed_data_path)
 
     if torch.cuda.is_available():
         LOGGER.info('CUDA is available. Using GPU for training.')
@@ -2271,7 +2355,6 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 history['train_acc'].append(train_acc)
                 history['val_loss'].append(val_loss)
                 history['val_acc'].append(val_acc)
-
                 scheduler.step(val_loss)
 
                 is_best = False
@@ -2443,32 +2526,31 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     eval_model.train()
     try:
-        sample_batches = []
-        for b in train_loader:
-            sample_batches.append(b)
-            if len(sample_batches) >= 1:
-                break
-        if sample_batches:
-            sample_batch = sample_batches[0].to(device)
-            for _ in range(2):
-                _doc = sample_batch.doc_emb if hasattr(sample_batch, 'doc_emb') else None
-                _o = eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch, doc_emb=_doc) if isinstance(eval_model, APTAttributionGraphSAGE) else eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch)
-                _loss = _compute_loss(criterion, _o, sample_batch.y)
-                _loss.backward()
-            for _ in range(5):
+        if enable_micro_benchmark:
+            benchmark_graph = min(
+                train_graphs,
+                key=lambda graph: int(graph.num_nodes) + int(graph.num_edges),
+            )
+            sample_batch = next(iter(DataLoader([benchmark_graph], batch_size=1, shuffle=False))).to(device)
+            with torch.no_grad():
+                _ = _forward_model(eval_model, sample_batch)
+            for _ in range(3):
                 ft = CudaTimer(device)
                 ft.start()
-                _doc = sample_batch.doc_emb if hasattr(sample_batch, 'doc_emb') else None
-                _o = eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch, doc_emb=_doc) if isinstance(eval_model, APTAttributionGraphSAGE) else eval_model(sample_batch.x, sample_batch.edge_index, sample_batch.batch)
+                with torch.no_grad():
+                    _o = _forward_model(eval_model, sample_batch)
                 f_ms = ft.stop()
                 time_logger.add_forward_ms(f_ms)
 
-                bt = CudaTimer(device)
-                bt.start()
-                _loss = _compute_loss(criterion, _o, sample_batch.y)
-                _loss.backward()
-                b_ms = bt.stop()
-                time_logger.add_backward_ms(b_ms)
+            eval_model.zero_grad(set_to_none=True)
+            bt = CudaTimer(device)
+            bt.start()
+            _o = _forward_model(eval_model, sample_batch)
+            _loss = _compute_loss(criterion, _o, sample_batch.y)
+            _loss.backward()
+            b_ms = bt.stop()
+            time_logger.add_backward_ms(b_ms)
+            eval_model.zero_grad(set_to_none=True)
     except Exception as exc:
         LOGGER.warning('forward/backward micro-bench failed: %s', exc)
 
@@ -2485,6 +2567,8 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 _batch_idx = torch.zeros(gd.x.size(0), dtype=torch.long, device=device)
                 if isinstance(eval_model, APTAttributionGraphSAGE):
                     _ = eval_model(gd.x, gd.edge_index, _batch_idx, doc_emb=_doc)
+                elif RelationAwareGAT is not None and isinstance(eval_model, RelationAwareGAT):
+                    _ = eval_model(gd.x, gd.edge_index, _batch_idx, getattr(gd, 'edge_type', None))
                 else:
                     _ = eval_model(gd.x, gd.edge_index, _batch_idx)
                 inf_ms_list.append(ct.stop())
@@ -2498,16 +2582,21 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         def _sample_input_fn():
-            g = test_graphs[0].to(device)
+            g = min(test_graphs, key=lambda graph: int(graph.num_nodes) + int(graph.num_edges)).to(device)
             bidx = torch.zeros(g.x.size(0), dtype=torch.long, device=device)
+            if RelationAwareGAT is not None and isinstance(eval_model, RelationAwareGAT):
+                return (g.x, g.edge_index, bidx, getattr(g, 'edge_type', None))
             return (g.x, g.edge_index, bidx)
 
-        flops = count_flops_safe(eval_model, _sample_input_fn)
+        flops = count_flops_safe(eval_model, _sample_input_fn) if enable_flops else None
         if flops is not None:
             time_logger.update(flops_per_forward=int(flops))
     except Exception as exc:
         LOGGER.debug('FLOPs estimation skipped: %s', exc)
 
+    time_logger.update(post_training_benchmarks_enabled=bool(
+        enable_micro_benchmark or enable_flops or inference_benchmark_samples > 0
+    ))
     time_logger.finalize()
     time_log_path = run_output_dir / 'time_log.json'
     time_logger.save(time_log_path)

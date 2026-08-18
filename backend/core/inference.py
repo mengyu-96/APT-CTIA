@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import sys
 from collections import defaultdict, deque
 from pathlib import Path
@@ -81,6 +82,42 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _score_quality(values: List[float]) -> Dict[str, Any]:
+    scores = [max(_safe_float(value), 0.0) for value in values]
+    count = len(scores)
+    total = sum(scores)
+    if count < 2 or total <= 0:
+        return {
+            "reliable": False,
+            "reason": "insufficient_scores",
+            "count": count,
+            "normalized_entropy": 1.0,
+            "coefficient_of_variation": 0.0,
+            "top_to_mean": 1.0,
+        }
+
+    mean = total / count
+    variance = sum((value - mean) ** 2 for value in scores) / count
+    coefficient_of_variation = math.sqrt(variance) / mean if mean > 0 else 0.0
+    probabilities = [value / total for value in scores]
+    entropy = -sum(probability * math.log(probability) for probability in probabilities if probability > 0)
+    normalized_entropy = entropy / math.log(count)
+    top_to_mean = max(scores) / mean
+    reliable = (
+        coefficient_of_variation >= 0.05
+        and top_to_mean >= 1.10
+        and normalized_entropy <= 0.98
+    )
+    return {
+        "reliable": reliable,
+        "reason": "differentiated" if reliable else "near_uniform_distribution",
+        "count": count,
+        "normalized_entropy": float(normalized_entropy),
+        "coefficient_of_variation": float(coefficient_of_variation),
+        "top_to_mean": float(top_to_mean),
+    }
+
+
 def _load_attack_mapping() -> Dict[str, List[str]]:
     for path in ATTACK_JSON_CANDIDATES:
         if not path.exists() or path.stat().st_size <= 0:
@@ -113,8 +150,22 @@ def _load_attack_mapping() -> Dict[str, List[str]]:
             return mapping
         except Exception as exc:
             LOGGER.warning("Failed to parse ATT&CK mapping from %s: %s", path, exc)
-    LOGGER.warning("ATT&CK mapping file not found; MITRE summary will be limited.")
-    return {}
+    # Offline fallback for the techniques emitted by the built-in behavior
+    # extractor.  External STIX data, when present, still takes precedence.
+    mapping = {
+        "T1005": ["collection"],
+        "T1027": ["defense evasion"],
+        "T1041": ["exfiltration"],
+        "T1059": ["execution"],
+        "T1082": ["discovery"],
+        "T1083": ["discovery"],
+        "T1105": ["command and control"],
+        "T1140": ["defense evasion"],
+        "T1195": ["initial access"],
+        "T1622": ["defense evasion"],
+    }
+    LOGGER.info("Using built-in ATT&CK tactic mapping for %d extracted techniques", len(mapping))
+    return mapping
 
 
 def _load_entities_by_report(dataset_dir: Path) -> Dict[str, Dict[int, List[dict]]]:
@@ -177,6 +228,49 @@ def _filter_compatible_keys(sd: Dict[str, torch.Tensor], model: torch.nn.Module)
             " ..." if len(dropped) > 10 else "",
         )
     return kept
+
+
+def _load_feature_manifest(path: Path) -> Optional[Dict[str, Any]]:
+    manifest_path = path / "feature_manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fp:
+            manifest = json.load(fp)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read feature manifest at {manifest_path}: {exc}") from exc
+    if not isinstance(manifest, dict) or not manifest.get("fingerprint"):
+        raise RuntimeError(f"Invalid feature manifest at {manifest_path}")
+    return manifest
+
+
+def _assert_feature_compatibility(
+    model_dir: Path,
+    dataset_dir: Path,
+    train_config: Dict[str, Any],
+) -> None:
+    model_manifest = _load_feature_manifest(model_dir)
+    if model_manifest is None:
+        training_data_path = train_config.get("processed_data_path")
+        if training_data_path:
+            model_manifest = _load_feature_manifest(Path(training_data_path))
+    dataset_manifest = _load_feature_manifest(dataset_dir)
+
+    if model_manifest is None and dataset_manifest is None:
+        LOGGER.warning("Feature manifests are missing; treating model and dataset as legacy artifacts.")
+        return
+    if model_manifest is None or dataset_manifest is None:
+        raise RuntimeError(
+            "Feature contract mismatch: one artifact is legacy and the other is versioned. "
+            "Reprocess the training data and retrain the model before inference."
+        )
+    if model_manifest["fingerprint"] != dataset_manifest["fingerprint"]:
+        raise RuntimeError(
+            "Feature contract mismatch between model and inference dataset: "
+            f"model={model_manifest['fingerprint'][:12]}, "
+            f"dataset={dataset_manifest['fingerprint'][:12]}. "
+            "Use a model trained from the same preprocessing feature schema."
+        )
 
 
 def load_model_for_inference(
@@ -247,15 +341,28 @@ def _build_node_metadata(graph: Data, report_entities: Dict[int, List[dict]]) ->
     node_labels = list(getattr(graph, "node_labels", []) or [])
     node_paragraphs = list(getattr(graph, "node_paragraph_indices", []) or [])
     if len(node_texts) == node_count and len(node_labels) == node_count:
-        return [
-            {
+        entity_lookup: Dict[Tuple[str, str], dict] = {}
+        for paragraph_entries in report_entities.values():
+            for entry in paragraph_entries:
+                key = (str(entry.get("text", "")).strip().lower(), str(entry.get("label", "UNKNOWN")))
+                if key[0] and key not in entity_lookup:
+                    entity_lookup[key] = entry
+        nodes = []
+        for idx in range(node_count):
+            text = str(node_texts[idx])
+            label = str(node_labels[idx])
+            entry = entity_lookup.get((text.strip().lower(), label), {})
+            nodes.append({
                 "id": idx,
-                "text": str(node_texts[idx]),
-                "label": str(node_labels[idx]),
+                "text": text,
+                "label": label,
                 "paragraph_index": int(node_paragraphs[idx]) if idx < len(node_paragraphs) else -1,
-            }
-            for idx in range(node_count)
-        ]
+                "source": entry.get("source"),
+                "mapping_reason": entry.get("mapping_reason"),
+                "start": entry.get("start"),
+                "end": entry.get("end"),
+            })
+        return nodes
 
     nodes = [{
         "id": 0,
@@ -298,7 +405,10 @@ def _edge_importance_map(attention_data: Dict[str, Any]) -> Dict[Tuple[int, int]
     for i, weight in enumerate(edge_att):
         if i >= len(edge_index[0]) or i >= len(edge_index[1]):
             break
-        pair = tuple(sorted((int(edge_index[0][i]), int(edge_index[1][i]))))
+        source, target = int(edge_index[0][i]), int(edge_index[1][i])
+        if source == target:
+            continue
+        pair = tuple(sorted((source, target)))
         weights[pair] = max(weights.get(pair, 0.0), _safe_float(weight))
     return weights
 
@@ -322,7 +432,32 @@ def _shortest_path(start: int, goal: int, edges: List[Tuple[int, int]]) -> List[
                 return new_path
             visited.add(nxt)
             queue.append((nxt, new_path))
-    return [start, goal]
+    return []
+
+
+def _edge_relation_map(graph: Data) -> Dict[Tuple[int, int], str]:
+    edge_index = getattr(graph, "edge_index", None)
+    if edge_index is None:
+        return {}
+    relation_names = list(getattr(graph, "edge_relation_names", []) or [])
+    relation_ids = getattr(graph, "edge_type", None)
+    id_to_name = {
+        0: "local_cooccurrence", 1: "report_anchor", 2: "self_evidence",
+        3: "behavior_evidence", 4: "malware_artifact",
+        5: "operation_campaign", 6: "entity_context",
+    }
+    result: Dict[Tuple[int, int], str] = {}
+    for idx, (source, target) in enumerate(edge_index.t().tolist()):
+        if source == target:
+            continue
+        if idx < len(relation_names):
+            name = str(relation_names[idx])
+        elif isinstance(relation_ids, torch.Tensor) and idx < relation_ids.numel():
+            name = id_to_name.get(int(relation_ids[idx]), "entity_context")
+        else:
+            name = "entity_context"
+        result[tuple(sorted((int(source), int(target))))] = name
+    return result
 
 
 def _summarize_gate(attention_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -394,6 +529,8 @@ def _build_graph_payload(nodes: List[dict], edges: List[Tuple[int, int]], attent
     graph_edges = []
     seen = set()
     for src, dst in edges:
+        if src == dst:
+            continue
         pair = tuple(sorted((src, dst)))
         if pair in seen:
             continue
@@ -418,41 +555,111 @@ def _build_explanation(
     node_attention = attention_data.get("node_attention") or []
     graph_data = _build_graph_payload(nodes, edges, attention_data)
 
+    evidence_node_scores = [
+        _safe_float(node_attention[idx] if idx < len(node_attention) else 0.0)
+        for idx, node in enumerate(nodes)
+        if not (idx == 0 and node.get("label") == "REPORT")
+    ]
+    node_quality = _score_quality(evidence_node_scores)
+    edge_importance = _edge_importance_map(attention_data)
+    edge_quality = _score_quality(list(edge_importance.values()))
+    relation_map = _edge_relation_map(graph)
+    evidence_quality = {
+        "reliable": bool(node_quality["reliable"] or edge_quality["reliable"]),
+        "node_attention": node_quality,
+        "edge_attention": edge_quality,
+    }
+
     key_nodes = []
-    for idx, node in enumerate(nodes):
-        if idx == 0 and node.get("label") == "REPORT":
-            continue
-        key_nodes.append({
-            "node_id": node["id"],
-            "text": node["text"],
-            "type": node["label"],
-            "attention": _safe_float(node_attention[idx] if idx < len(node_attention) else 0.0),
-            "paragraph_index": node.get("paragraph_index", -1),
-        })
-    key_nodes.sort(key=lambda item: item["attention"], reverse=True)
-    key_nodes = key_nodes[:8]
+    if node_quality["reliable"]:
+        for idx, node in enumerate(nodes):
+            if (idx == 0 and node.get("label") == "REPORT") or node.get("label") == "DIRECT_ACTOR_MENTION":
+                continue
+            key_nodes.append({
+                "node_id": node["id"],
+                "text": node["text"],
+                "type": node["label"],
+                "attention": _safe_float(node_attention[idx] if idx < len(node_attention) else 0.0),
+                "evidence_score": _safe_float(node_attention[idx] if idx < len(node_attention) else 0.0),
+                "evidence_basis": "node_attention",
+                "paragraph_index": node.get("paragraph_index", -1),
+                "source": node.get("source"),
+                "mapping_reason": node.get("mapping_reason"),
+            })
+        key_nodes.sort(key=lambda item: item["evidence_score"], reverse=True)
+        key_nodes = key_nodes[:8]
+    elif edge_quality["reliable"]:
+        # Edge attention remains discriminative even when pooling attention is
+        # flat. Derive node evidence only from non-root, non-self relation
+        # endpoints and label it explicitly as edge-supported evidence.
+        incident_support: Dict[int, float] = defaultdict(float)
+        for (src, dst), weight in edge_importance.items():
+            if src == dst or src == 0 or dst == 0:
+                continue
+            incident_support[src] = max(incident_support[src], _safe_float(weight))
+            incident_support[dst] = max(incident_support[dst], _safe_float(weight))
+        for idx, score in sorted(incident_support.items(), key=lambda item: item[1], reverse=True):
+            if idx >= len(nodes) or nodes[idx].get("label") in {"REPORT", "DIRECT_ACTOR_MENTION"}:
+                continue
+            node = nodes[idx]
+            key_nodes.append({
+                "node_id": node["id"],
+                "text": node["text"],
+                "type": node["label"],
+                "attention": _safe_float(node_attention[idx] if idx < len(node_attention) else 0.0),
+                "evidence_score": _safe_float(score),
+                "evidence_basis": "incident_edge_attention",
+                "paragraph_index": node.get("paragraph_index", -1),
+                "source": node.get("source"),
+                "mapping_reason": node.get("mapping_reason"),
+            })
+            if len(key_nodes) >= 8:
+                break
+
+    evidence_quality["key_node_basis"] = (
+        "node_attention" if node_quality["reliable"]
+        else "incident_edge_attention" if key_nodes
+        else "none"
+    )
+    evidence_quality["key_node_count"] = len(key_nodes)
+
+    key_node_by_id = {int(item["node_id"]): item for item in key_nodes}
+    for graph_node in graph_data.get("nodes", []):
+        key_node = key_node_by_id.get(int(graph_node.get("id", -1)))
+        graph_node["raw_attention"] = graph_node.get("importance", 0.0)
+        graph_node["is_key_evidence"] = key_node is not None
+        if key_node is not None:
+            graph_node["importance"] = key_node["evidence_score"]
+            graph_node["evidence_basis"] = key_node["evidence_basis"]
+        else:
+            graph_node["evidence_basis"] = "node_attention"
 
     key_edges = []
-    for (src, dst), weight in sorted(_edge_importance_map(attention_data).items(), key=lambda item: item[1], reverse=True)[:8]:
-        key_edges.append({
-            "source": src,
-            "target": dst,
-            "source_text": nodes[src]["text"] if src < len(nodes) else f"NODE_{src}",
-            "target_text": nodes[dst]["text"] if dst < len(nodes) else f"NODE_{dst}",
-            "source_type": nodes[src]["label"] if src < len(nodes) else "UNKNOWN",
-            "target_type": nodes[dst]["label"] if dst < len(nodes) else "UNKNOWN",
-            "weight": _safe_float(weight),
-        })
+    if edge_quality["reliable"]:
+        for (src, dst), weight in sorted(edge_importance.items(), key=lambda item: item[1], reverse=True)[:8]:
+            key_edges.append({
+                "source": src,
+                "target": dst,
+                "source_text": nodes[src]["text"] if src < len(nodes) else f"NODE_{src}",
+                "target_text": nodes[dst]["text"] if dst < len(nodes) else f"NODE_{dst}",
+                "source_type": nodes[src]["label"] if src < len(nodes) else "UNKNOWN",
+                "target_type": nodes[dst]["label"] if dst < len(nodes) else "UNKNOWN",
+                "weight": _safe_float(weight),
+                "relation": relation_map.get((src, dst), "entity_context"),
+            })
 
     evidence_paths = []
     root_id = 0 if nodes and nodes[0].get("label") == "REPORT" else None
     if root_id is not None:
         for node in key_nodes[:5]:
             path = _shortest_path(root_id, int(node["node_id"]), edges)
+            if not path:
+                continue
             evidence_paths.append({
                 "target_node_id": node["node_id"],
                 "target_text": node["text"],
-                "score": node["attention"],
+                "score": node["evidence_score"],
+                "evidence_basis": node["evidence_basis"],
                 "path_node_ids": path,
                 "path_texts": [nodes[path_idx]["text"] for path_idx in path if path_idx < len(nodes)],
             })
@@ -463,8 +670,21 @@ def _build_explanation(
     if key_nodes:
         summary_lines.append(
             "Top evidence nodes: " + ", ".join(
-                f"{item['text']} ({item['type']}, {item['attention']:.3f})" for item in key_nodes[:3]
+                f"{item['text']} ({item['type']}, {item['evidence_score']:.3f})" for item in key_nodes[:3]
             )
+        )
+    if not node_quality["reliable"]:
+        if key_nodes:
+            summary_lines.append(
+                "Node attention is nearly uniform; displayed nodes are supported by differentiated non-self edge attention."
+            )
+        else:
+            summary_lines.append(
+                "Node attention is nearly uniform and no differentiated relation evidence is available; key nodes are withheld."
+            )
+    if not evidence_quality["reliable"]:
+        summary_lines.append(
+            "Attention scores are nearly uniform; key evidence is withheld because differentiation is insufficient."
         )
     if mitre_summary["techniques"]:
         summary_lines.append(
@@ -474,6 +694,7 @@ def _build_explanation(
 
     return {
         "decision_mode": gate_summary,
+        "evidence_quality": evidence_quality,
         "key_nodes": key_nodes,
         "key_edges": key_edges,
         "evidence_paths": evidence_paths,
@@ -538,6 +759,7 @@ def run_inference_pipeline(
     with results_path.open("r", encoding="utf-8") as fp:
         train_results = json.load(fp)
     config = train_results.get("config", {})
+    _assert_feature_compatibility(model_dir, dataset_dir, config)
 
     class_names = []
     if "classification_report" in train_results:
@@ -591,7 +813,7 @@ def run_inference_pipeline(
             if isinstance(model, APTAttributionGraphSAGE):
                 out = model(batch.x, batch.edge_index, batch.batch, doc_emb=doc_emb)
             elif RelationAwareGAT is not None and isinstance(model, RelationAwareGAT):
-                out, att_data = model(batch.x, batch.edge_index, batch.batch, return_attention=True)
+                out, att_data = model(batch.x, batch.edge_index, batch.batch, getattr(batch, "edge_type", None), return_attention=True)
             else:
                 out = model(batch.x, batch.edge_index, batch.batch)
 

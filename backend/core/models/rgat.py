@@ -1,7 +1,9 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GATv2Conv, RGCNConv, global_mean_pool
+from torch_geometric.nn import GATConv, GATv2Conv, RGCNConv, global_add_pool, global_mean_pool
 from torch_geometric.nn.aggr import AttentionalAggregation
 
 class RGAPTiveFusion(nn.Module):
@@ -19,12 +21,18 @@ class RGAPTiveFusion(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
+        # Start from an unbiased mixture; training can then move the gate when
+        # supported by the classification objective.
+        nn.init.zeros_(self.gate_net[2].weight)
+        nn.init.zeros_(self.gate_net[2].bias)
+        self.last_alpha = None
 
     def forward(self, x_semantic, x_structural, return_gate=False):
         # Concatenate features
         combined = torch.cat([x_semantic, x_structural], dim=-1)
         # Compute gate coefficient alpha
         alpha = self.gate_net(combined)
+        self.last_alpha = alpha
         # Weighted sum: alpha * Semantic + (1 - alpha) * Structural
         fused = alpha * x_semantic + (1 - alpha) * x_structural
         if return_gate:
@@ -70,6 +78,12 @@ class RelationAwareGAT(torch.nn.Module):
         self.ablation_mode = ablation_mode
         self.fusion_mode = str(fusion_mode).strip().lower()
         self.pooling_mode = str(pooling_mode).strip().lower()
+        self._last_node_attention = None
+        self._last_attention_batch = None
+        # Keep the two theoretically complementary streams on comparable scales.
+        # Without branch normalization the RGCN stream can saturate the adaptive
+        # gate and silently discard semantic/context features on shifted reports.
+        self.input_norm = nn.LayerNorm(num_node_features)
         
         # Calculate number of possible relations (Source Type -> Target Type)
         self.num_relations = (num_entity_types + 1) ** 2
@@ -82,6 +96,7 @@ class RelationAwareGAT(torch.nn.Module):
             # Actually GATConv with concat=True outputs heads*out_channels
             # We want final output to be hidden_dim for fusion
             self.gat_conv = GATLayer(num_node_features, hidden_dim // num_heads, heads=num_heads, dropout=dropout)
+            self.semantic_norm = nn.LayerNorm(hidden_dim)
             # Projection to align dimensions if needed, but here heads * (hidden/heads) = hidden.
             
         # --- Branch 2: Structural Stream (RGCN) ---
@@ -96,6 +111,7 @@ class RelationAwareGAT(torch.nn.Module):
                 num_relations=self.num_relations,
                 num_bases=num_bases,
             )
+            self.structural_norm = nn.LayerNorm(hidden_dim)
 
         # --- RGAPTive Fusion ---
         if ablation_mode == "dual":
@@ -133,14 +149,17 @@ class RelationAwareGAT(torch.nn.Module):
             nn.Linear(hidden_dim, num_classes)
         )
 
-    def forward(self, x, edge_index, batch, return_attention=False):
-        # --- Dynamic Relation Inference (Innovation Point 1) ---
-        # Infer edge types on the fly based on node entity types
-        type_dim = min(self.num_entity_types, x.size(1))
-        src_type = x[edge_index[0], :type_dim].argmax(dim=1)
-        dst_type = x[edge_index[1], :type_dim].argmax(dim=1)
-        edge_type = src_type * (type_dim + 1) + dst_type
-        edge_type = edge_type.clamp(max=self.num_relations - 1)
+    def forward(self, x, edge_index, batch, edge_type=None, return_attention=False):
+        x = self.input_norm(x)
+        # Prefer the relation extracted from report evidence.  Older graphs do
+        # not carry edge_type, so retain the original type-based fallback.
+        if edge_type is None:
+            type_dim = min(self.num_entity_types, x.size(1))
+            src_type = x[edge_index[0], :type_dim].argmax(dim=1)
+            dst_type = x[edge_index[1], :type_dim].argmax(dim=1)
+            edge_type = src_type * (type_dim + 1) + dst_type
+        edge_type = edge_type.to(device=x.device, dtype=torch.long).view(-1)
+        edge_type = edge_type.clamp(min=0, max=self.num_relations - 1)
 
         # --- Layer 1: Dual-Stream Processing ---
         x_semantic = None
@@ -155,9 +174,11 @@ class RelationAwareGAT(torch.nn.Module):
                 att_weights = {"edge_index": att_edge_index, "edge_attention": att_alpha}
             else:
                 x_semantic = self.gat_conv(x, edge_index) # [N, Hidden]
+            x_semantic = self.semantic_norm(x_semantic)
         
         if self.ablation_mode in ["dual", "rgcn_only"]:
             x_structural = self.rgcn_conv(x, edge_index, edge_type) # [N, Hidden]
+            x_structural = self.structural_norm(x_structural)
 
         # --- Feature Fusion ---
         gate_alpha = None
@@ -181,17 +202,24 @@ class RelationAwareGAT(torch.nn.Module):
 
         # --- Layer 2: Deep Refinement ---
         x = self.conv2(x, edge_index)
+
+        if self.attention_pool is not None:
+            from torch_geometric.utils import softmax
+            node_scores = self.attention_pool.gate_nn(x).view(-1, 1)
+            node_att_weights = softmax(node_scores, batch)
+            self._last_node_attention = node_att_weights
+            self._last_attention_batch = batch
+        else:
+            node_att_weights = None
+            self._last_node_attention = None
+            self._last_attention_batch = None
         
         # --- Readout: Global Attention Pooling ---
         if return_attention:
             if att_weights is None:
                 att_weights = {}
             if self.attention_pool is not None:
-                # Calculate node attention weights manually for visualization.
-                node_scores = self.attention_pool.gate_nn(x).view(-1, 1)
-                from torch_geometric.utils import softmax
-                node_att_weights = softmax(node_scores, batch)
-                att_weights["node_attention"] = node_att_weights
+                att_weights["node_attention"] = self._last_node_attention
             att_weights["fusion_mode"] = self.fusion_mode
             att_weights["pooling_mode"] = self.pooling_mode
             if gate_alpha is not None:
@@ -206,7 +234,7 @@ class RelationAwareGAT(torch.nn.Module):
                 att_weights["structural_gate_mean"] = torch.tensor(1.0, device=x.device)
 
         if self.attention_pool is not None:
-            x = self.attention_pool(x, batch)  # [Batch_Size, Hidden_Dim]
+            x = global_add_pool(node_att_weights * x, batch)
         else:
             x = global_mean_pool(x, batch)
             
@@ -217,3 +245,30 @@ class RelationAwareGAT(torch.nn.Module):
             return out, att_weights
             
         return out
+
+    def auxiliary_regularization_loss(self):
+        """Discourage branch starvation and non-informative uniform pooling."""
+        reference = next(self.parameters())
+        penalty = reference.new_zeros(())
+        if self.ablation_mode == "dual" and self.fusion_mode == "adaptive":
+            alpha = getattr(self.fusion, "last_alpha", None)
+            if isinstance(alpha, torch.Tensor) and alpha.numel() > 0:
+                gate_offset = torch.abs(alpha.mean() - 0.5)
+                penalty = penalty + F.relu(gate_offset - 0.30).pow(2)
+
+        weights = self._last_node_attention
+        batch = self._last_attention_batch
+        if isinstance(weights, torch.Tensor) and isinstance(batch, torch.Tensor) and weights.numel() > 0:
+            entropies = []
+            flat_weights = weights.view(-1)
+            for graph_id in torch.unique(batch):
+                graph_weights = flat_weights[batch == graph_id]
+                if graph_weights.numel() <= 1:
+                    continue
+                graph_weights = graph_weights / graph_weights.sum().clamp_min(1e-12)
+                entropy = -(graph_weights * graph_weights.clamp_min(1e-12).log()).sum()
+                entropies.append(entropy / math.log(graph_weights.numel()))
+            if entropies:
+                normalized_entropy = torch.stack(entropies).mean()
+                penalty = penalty + F.relu(normalized_entropy - 0.95).pow(2)
+        return penalty

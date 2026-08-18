@@ -22,7 +22,7 @@ from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, LongTable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 LOGGER = logging.getLogger(__name__)
@@ -113,6 +113,7 @@ class ReportGenerator:
                 spaceBefore=12,
                 spaceAfter=8,
                 textColor=colors.HexColor("#123B66"),
+                keepWithNext=True,
             )
         )
         self.styles.add(
@@ -124,6 +125,7 @@ class ReportGenerator:
                 spaceBefore=8,
                 spaceAfter=6,
                 textColor=colors.HexColor("#2C4A63"),
+                keepWithNext=True,
             )
         )
         self.styles.add(
@@ -198,10 +200,13 @@ class ReportGenerator:
         common_entities = self._common_entity_types(result_records)
         common_techniques = self._common_techniques(result_records)
         representative_samples = self._representative_samples(result_records, top_attr)
-        graph_img = self._generate_graph_image(
-            analysis_results.get("graph_data") or explanation.get("graph_data"),
-            analysis_results.get("attention_data"),
-        )
+        evidence_quality = explanation.get("evidence_quality") or {}
+        graph_img = None
+        if not evidence_quality or evidence_quality.get("reliable", False):
+            graph_img = self._generate_graph_image(
+                analysis_results.get("graph_data") or explanation.get("graph_data"),
+                analysis_results.get("attention_data"),
+            )
 
         story: List[Any] = []
         story.extend(self._build_cover(task_id, total_samples))
@@ -220,10 +225,10 @@ class ReportGenerator:
         story.extend(self._build_decision_section(explanation, common_entities, common_techniques))
         if graph_img:
             story.extend(self._build_graph_section(graph_img))
-        story.extend(self._build_representative_samples(representative_samples))
+        story.extend(self._build_representative_samples(representative_samples, section_number=6 if graph_img else 5))
         story.extend(self._build_appendix(result_records))
 
-        doc.build(story)
+        doc.build(story, onFirstPage=self._draw_page_number, onLaterPages=self._draw_page_number)
         LOGGER.info("Report generated successfully: %s", pdf_path)
         return str(pdf_path)
 
@@ -324,38 +329,65 @@ class ReportGenerator:
                 )
             )
 
+        evidence_quality = explanation.get("evidence_quality") or {}
+        node_quality = evidence_quality.get("node_attention") or {}
+        if node_quality and not node_quality.get("reliable", False):
+            key_node_basis = evidence_quality.get("key_node_basis")
+            if key_node_basis == "incident_edge_attention":
+                quality_message = (
+                    "解释质量提示：节点注意力分布接近均匀；下列关键实体由具有区分度的非自环关联边支持，"
+                    "证据分数表示相邻关系注意力，而非节点池化注意力。"
+                )
+            else:
+                quality_message = (
+                    "解释质量提示：节点注意力分布接近均匀，当前结果不足以形成具有显著区分度的关键证据排序。"
+                    "报告不会将任意高分节点表述为可靠关键证据。"
+                )
+            story.append(
+                Paragraph(
+                    quality_message,
+                    self.styles["CNBody"],
+                )
+            )
+
         if common_entities:
             entity_text = "；".join(f"{name} ({count})" for name, count in common_entities[:8])
             story.append(Paragraph(f"高频证据类型：{_escape(entity_text)}。", self.styles["CNBody"]))
 
         key_nodes = explanation.get("key_nodes") or []
         if key_nodes:
-            rows = [["实体", "类型", "注意力", "段落位置"]]
+            rows = [["实体", "类型", "证据分数", "证据来源", "段落"]]
             for item in key_nodes[:8]:
+                basis = "节点注意力" if item.get("evidence_basis") == "node_attention" else "关联边支持"
                 rows.append(
                     [
                         str(item.get("text", "")),
                         str(item.get("type", "")),
-                        f"{_safe_float(item.get('attention')):.3f}",
+                        f"{_safe_float(item.get('evidence_score', item.get('attention'))):.3f}",
+                        basis,
                         str(item.get("paragraph_index", "-")),
                     ]
                 )
             story.append(Paragraph("4.1 关键实体证据", self.styles["CNH2"]))
-            story.append(self._build_table(rows, [2.5 * inch, 1.25 * inch, 0.9 * inch, 1.0 * inch], small=True))
+            story.append(self._build_table(rows, [2.1 * inch, 1.0 * inch, 0.75 * inch, 1.15 * inch, 0.65 * inch], small=True))
+        elif evidence_quality:
+            story.append(Paragraph("4.1 关键实体证据", self.styles["CNH2"]))
+            story.append(Paragraph("暂无通过区分度校验的关键实体证据。", self.styles["CNBodySmall"]))
 
         key_edges = explanation.get("key_edges") or []
         if key_edges:
-            rows = [["源节点", "目标节点", "关系强度"]]
+            rows = [["源节点", "目标节点", "关系", "强度"]]
             for item in key_edges[:8]:
                 rows.append(
                     [
                         str(item.get("source_text", "")),
                         str(item.get("target_text", "")),
+                        str(item.get("relation", "entity_context")),
                         f"{_safe_float(item.get('weight')):.3f}",
                     ]
                 )
             story.append(Paragraph("4.2 关键关联边", self.styles["CNH2"]))
-            story.append(self._build_table(rows, [2.6 * inch, 2.6 * inch, 0.8 * inch], small=True))
+            story.append(self._build_table(rows, [2.0 * inch, 2.0 * inch, 1.25 * inch, 0.65 * inch], small=True))
 
         evidence_paths = explanation.get("evidence_paths") or []
         if evidence_paths:
@@ -389,8 +421,13 @@ class ReportGenerator:
             Paragraph("图 1. 代表样本证据图谱", self.styles["CNCap"]),
         ]
 
-    def _build_representative_samples(self, samples: list[dict[str, Any]]) -> List[Any]:
-        story = [Paragraph("6. 代表样本分析", self.styles["CNH1"])]
+    def _build_representative_samples(
+        self,
+        samples: list[dict[str, Any]],
+        *,
+        section_number: int,
+    ) -> List[Any]:
+        story = [Paragraph(f"{section_number}. 代表样本分析", self.styles["CNH1"])]
         if not samples:
             story.append(Paragraph("当前没有可用于展开说明的代表样本。", self.styles["CNBody"]))
             return story
@@ -402,7 +439,12 @@ class ReportGenerator:
                 f"{item.get('label', 'Unknown')} { _safe_float(item.get('score')):.2%}" for item in top3[:3]
             ) or "无"
             summary_lines = explanation.get("summary_lines") or []
-            story.append(Paragraph(f"6.{idx} 样本 { _escape(sample.get('report_id', 'Unknown')) }", self.styles["CNH2"]))
+            story.append(
+                Paragraph(
+                    f"{section_number}.{idx} 样本 { _escape(sample.get('report_id', 'Unknown')) }",
+                    self.styles["CNH2"],
+                )
+            )
             story.append(
                 Paragraph(
                     (
@@ -413,12 +455,21 @@ class ReportGenerator:
                     self.styles["CNBody"],
                 )
             )
-            for line in summary_lines[:3]:
-                story.append(Paragraph(_escape(line), self.styles["CNBodySmall"]))
+            evidence_quality = explanation.get("evidence_quality") or {}
+            if evidence_quality and not evidence_quality.get("reliable", False):
+                story.append(
+                    Paragraph(
+                        "解释证据区分度不足，未展示关键节点和关联边排序。",
+                        self.styles["CNBodySmall"],
+                    )
+                )
+            else:
+                for line in summary_lines[:3]:
+                    story.append(Paragraph(_escape(line), self.styles["CNBodySmall"]))
         return story
 
     def _build_appendix(self, records: list[dict[str, Any]]) -> List[Any]:
-        story = [PageBreak(), Paragraph("附录 A. 样本明细", self.styles["CNH1"])]
+        story = [Paragraph("附录 A. 样本明细", self.styles["CNH1"])]
         rows = [["样本ID", "预测组织", "置信度", "Top-2 候选"]]
         for item in self._top_records(records, limit=20):
             top3 = item.get("top3") or []
@@ -443,7 +494,15 @@ class ReportGenerator:
         return story
 
     def _build_table(self, rows: List[List[str]], widths: List[float], *, small: bool = False) -> Table:
-        table = Table(rows, colWidths=widths, repeatRows=1)
+        available_width = A4[0] - 84
+        if sum(widths) > available_width:
+            scale = available_width / sum(widths)
+            widths = [width * scale for width in widths]
+        flowable_rows = [
+            [self._table_cell(value, header=row_index == 0, small=small) for value in row]
+            for row_index, row in enumerate(rows)
+        ]
+        table = LongTable(flowable_rows, colWidths=widths, repeatRows=1, splitByRow=1)
         font_size = 8 if small else 9
         table.setStyle(
             TableStyle(
@@ -466,6 +525,29 @@ class ReportGenerator:
         )
         table.hAlign = "LEFT"
         return table
+
+    def _table_cell(self, value: Any, *, header: bool, small: bool) -> Paragraph:
+        style = ParagraphStyle(
+            name=f"TableCell-{header}-{small}",
+            parent=self.styles["CNBodySmall" if small else "CNBody"],
+            fontName=self.font_name,
+            fontSize=8 if small else 9,
+            leading=10.5 if small else 12,
+            textColor=colors.white if header else colors.HexColor("#1F2933"),
+            wordWrap="CJK",
+            splitLongWords=1,
+            spaceBefore=0,
+            spaceAfter=0,
+        )
+        text = _escape(value).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+        return Paragraph(text, style)
+
+    def _draw_page_number(self, canvas: Any, doc: Any) -> None:
+        canvas.saveState()
+        canvas.setFont(self.font_name, 8)
+        canvas.setFillColor(colors.HexColor("#64748B"))
+        canvas.drawRightString(A4[0] - 42, 16, f"第 {doc.page} 页")
+        canvas.restoreState()
 
     def _normalize_records(self, raw_records: Any) -> list[dict[str, Any]]:
         if not isinstance(raw_records, list):
@@ -509,7 +591,7 @@ class ReportGenerator:
             "median": statistics.median(values),
             "min": min(values),
             "max": max(values),
-            "high_count": float(sum(1 for value in values if value >= 0.90)),
+            "high_count": int(sum(1 for value in values if value >= 0.90)),
         }
 
     def _dominant_signal(self, records: list[dict[str, Any]]) -> str:

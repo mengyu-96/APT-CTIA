@@ -759,6 +759,10 @@ def run_inference_pipeline(
     with results_path.open("r", encoding="utf-8") as fp:
         train_results = json.load(fp)
     config = train_results.get("config", {})
+
+    # Probability temperature scaling.
+    temperature = 0.52
+
     _assert_feature_compatibility(model_dir, dataset_dir, config)
 
     class_names = []
@@ -817,7 +821,7 @@ def run_inference_pipeline(
             else:
                 out = model(batch.x, batch.edge_index, batch.batch)
 
-            probs = F.softmax(out, dim=1)
+            probs = F.softmax(out / temperature, dim=1)
             preds = probs.argmax(dim=1)
             all_preds.extend(preds.detach().cpu().numpy())
             all_probs.extend(probs.detach().cpu().numpy())

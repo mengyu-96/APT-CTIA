@@ -481,7 +481,7 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
                 if ok:
                     invalidate("datasets", "raw_datasets")
                     st.success(f"任务已提交! ID: {res['task_id']}")
-                    st.info("请前往 [分析任务管理] 查看进度。")
+                    st.info("请前往 [预处理任务管理] 查看进度。")
                 else:
                     st.error(f"提交失败: {res}")
 

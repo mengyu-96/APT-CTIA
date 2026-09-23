@@ -3,9 +3,12 @@ headless = true
 port = 8501
 enableCORS = true
 
+[client]
+toolbarMode = "minimal"
+
 [theme]
-primaryColor = "#00d4ff"
-backgroundColor = "#00172e"
-secondaryBackgroundColor = "#002244"
-textColor = "#ffffff"
+primaryColor = "#38BDF8"
+backgroundColor = "#050C14"
+secondaryBackgroundColor = "#07131F"
+textColor = "#E7EEF7"
 font = "sans serif"

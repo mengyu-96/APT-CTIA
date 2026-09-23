@@ -6,22 +6,31 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: apt_attribution_backend
-    ports:
-      - "5001:5001"
+    expose:
+      - "5001"
     env_file:
       - .env
     environment:
       PYTHONPATH: /app:/app/backend
-      DEMO_MODE: ${DEMO_MODE:-true}
+      DEMO_MODE: ${DEMO_MODE:-false}
       ENABLE_PREPROCESSING: ${ENABLE_PREPROCESSING:-true}
       ENABLE_INFERENCE: ${ENABLE_INFERENCE:-true}
-      ENABLE_TRAINING: ${ENABLE_TRAINING:-false}
-      SHOW_TRAINING_UI: ${SHOW_TRAINING_UI:-false}
-      ALLOW_TRAINING_REPORT_SOURCE: ${ALLOW_TRAINING_REPORT_SOURCE:-false}
+      ENABLE_TRAINING: ${ENABLE_TRAINING:-true}
+      SHOW_TRAINING_UI: ${SHOW_TRAINING_UI:-true}
+      ALLOW_TRAINING_REPORT_SOURCE: ${ALLOW_TRAINING_REPORT_SOURCE:-true}
+      ATTRIBUTION_MIN_CONFIDENCE: ${ATTRIBUTION_MIN_CONFIDENCE:-0.60}
+      ATTRIBUTION_MIN_MARGIN: ${ATTRIBUTION_MIN_MARGIN:-0.10}
+      ATTRIBUTION_MIN_EVIDENCE_COUNT: ${ATTRIBUTION_MIN_EVIDENCE_COUNT:-1}
     volumes:
       - ./dataset_TXT:/app/dataset_TXT
       - ./results_archive:/app/results_archive
       - ./uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5001/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   frontend:
@@ -36,9 +45,20 @@ services:
     environment:
       BACKEND_URL: ${BACKEND_URL:-http://backend:5001}
       ENABLE_UI_AUTH: ${ENABLE_UI_AUTH:-true}
-      AUTH_USERNAME: ${AUTH_USERNAME:-admin}
-      AUTH_PASSWORD: ${AUTH_PASSWORD:-admin}
-      AUTH_SESSION_SECRET: ${AUTH_SESSION_SECRET:-rgapt-session-secret}
+      ENABLE_SELF_REGISTRATION: ${ENABLE_SELF_REGISTRATION:-true}
+      AUTH_USERS_FILE: ${AUTH_USERS_FILE:-/app/auth_data/users.json}
+      AUTH_USERNAME: ${AUTH_USERNAME:-}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-28800}
+    volumes:
+      - ./auth_data:/app/auth_data
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped

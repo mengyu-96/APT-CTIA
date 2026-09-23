@@ -158,6 +158,16 @@ def get_dashboard_counts() -> dict[str, int]:
     }
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def get_system_health() -> str:
+    """Return a user-facing backend health label without masking failures."""
+    try:
+        response = _request("GET", "/api/runtime_config", timeout=1.5)
+        return "正常" if response.status_code == 200 else "异常"
+    except Exception:
+        return "离线"
+
+
 def get_artifact_bytes(path: str, *, timeout: float = 5) -> bytes | None:
     if not path:
         return None
@@ -233,6 +243,7 @@ def invalidate(*domains: str) -> None:
     for domain in domains:
         _DOMAIN_SALT[domain] = _DOMAIN_SALT.get(domain, 0) + 1
     get_dashboard_counts.clear()
+    get_system_health.clear()
 
 
 def clear_api_cache() -> None:
@@ -242,3 +253,4 @@ def clear_api_cache() -> None:
     _read_local_bytes.clear()
     _get_bytes.clear()
     get_dashboard_counts.clear()
+    get_system_health.clear()

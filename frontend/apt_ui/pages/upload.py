@@ -20,7 +20,7 @@ def _task_title(task: dict) -> str:
 
 
 def render_upload() -> None:
-    ui.page_header("分析任务管理", "Analysis Task Management", icon="fa-tasks")
+    ui.page_header("分析任务管理", "上传文件并跟踪预处理进度", icon="fa-tasks")
 
     left, right = st.columns([1, 1], gap="large")
 

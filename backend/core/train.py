@@ -53,6 +53,11 @@ from torch_geometric.nn import GATConv, GCNConv, TransformerConv, SAGEConv, GINC
 from torch_geometric.nn.aggr import AttentionalAggregation
 from torch_geometric.utils import dropout_adj
 
+try:
+    from backend.core.dataset_splits import load_split_preferences
+except ImportError:
+    from core.dataset_splits import load_split_preferences  # type: ignore
+
 # Timing & resource utils
 try:
     from utils.timing import TimeLogger, CudaTimer, count_params, count_flops_safe, peak_vram_mb, peak_ram_mb, reset_vram_peak
@@ -2156,15 +2161,17 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     if hasattr(graphs[0], 'doc_emb') and graphs[0].doc_emb is not None:
         text_emb_dim = graphs[0].doc_emb.size(1)
 
+    split_preferences = load_split_preferences(processed_data_path, seed=seed)
     train_graphs, val_graphs, test_graphs, split_meta = split_graph_dataset(
         graphs,
-        seed=seed,
+        seed=int(split_preferences["seed"]),
         split_mode=split_mode,
         raw_index_path=raw_index_path,
-        train_ratio=0.7,
-        val_ratio=0.1,
-        test_ratio=0.2,
+        train_ratio=float(split_preferences["train_ratio"]),
+        val_ratio=float(split_preferences["val_ratio"]),
+        test_ratio=float(split_preferences["test_ratio"]),
     )
+    split_meta["split_configuration_source"] = split_preferences["source"]
     time_logger.update(**split_meta)
 
     num_workers = _resolve_dataloader_workers(config)
@@ -2634,5 +2641,4 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         json.dump(results, f, indent=2, default=str)
 
     return results
-
 

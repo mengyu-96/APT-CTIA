@@ -48,8 +48,8 @@ def get_datasets():
 def get_raw_datasets():
     return get_json("/api/raw_datasets", timeout=5, default=[])
 
-def get_raw_files(path):
-    return get_json("/api/raw_datasets/files", params={"path": path}, timeout=5, default={})
+def get_raw_files(dataset_id):
+    return get_json("/api/raw_datasets/files", params={"dataset_id": dataset_id}, timeout=5, default={})
 
 def get_dataset_graphs(dataset_id):
     return get_json(f"/api/datasets/{dataset_id}/graphs", timeout=5, default=[], ttl="slow")
@@ -89,13 +89,14 @@ def delete_graph(dataset_id, report_id):
     except Exception as e:
         return False, str(e)
 
-def split_dataset(dataset_id, train_ratio, val_ratio):
+def split_dataset(dataset_id, train_ratio, val_ratio, seed=42):
     try:
         test_ratio = 1.0 - train_ratio - val_ratio
         payload = {
             "train_ratio": train_ratio,
             "val_ratio": val_ratio,
-            "test_ratio": test_ratio
+            "test_ratio": test_ratio,
+            "seed": int(seed),
         }
         response = request("POST", f"/api/datasets/{dataset_id}/split", json_body=payload, timeout=5)
         if response.status_code == 200:
@@ -105,9 +106,9 @@ def split_dataset(dataset_id, train_ratio, val_ratio):
     except Exception as e:
         return False, str(e)
 
-def start_preprocessing(raw_path):
+def start_preprocessing(raw_dataset_id):
     try:
-        payload = {"raw_dataset_path": raw_path}
+        payload = {"raw_dataset_id": raw_dataset_id}
         response = request("POST", "/api/preprocess", json_body=payload, timeout=(5, 60))
         if response.status_code == 202:
             return True, response.json()
@@ -220,7 +221,6 @@ def _raw_dataset_rows(datasets):
             "Select": False,
             "Name": d['name'],
             "Files": d['file_count'],
-            "Path": d['path']
         }
         for d in datasets
     ]
@@ -282,7 +282,7 @@ def render_raw_file_explorer():
     is_root = len(current_path) == 0
     
     # --- Breadcrumbs & Header ---
-    path_str = " 🏠 Home"
+    path_str = " 🏠 首页"
     if not is_root:
         path_str += f" / 📂 {current_path[0]}"
     
@@ -353,7 +353,6 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
             "Select": st.column_config.CheckboxColumn("选择", width="small"),
             "Name": st.column_config.TextColumn("数据集名称", width="medium"),
             "Files": st.column_config.NumberColumn("文件数", width="small"),
-            "Path": st.column_config.TextColumn("路径", width="large", disabled=True),
         },
         hide_index=True,
         key="root_editor",
@@ -401,16 +400,23 @@ def _render_root_view(c_new, c_paste, c_del, c_rename):
     # Batch Delete
     with c_del:
         if not selected_rows.empty:
-            if st.button("🗑️ 删除", type="primary", width="stretch"):
+            selected_names = selected_rows["Name"].tolist()
+
+            def delete_selected_raw_datasets() -> None:
                 success_count = 0
-                for _, row in selected_rows.iterrows():
-                    ok, _ = delete_raw_dataset(row['Name'])
+                for name in selected_names:
+                    ok, _ = delete_raw_dataset(name)
                     if ok: success_count += 1
                 if success_count > 0:
                     invalidate("datasets", "raw_datasets")
                     st.toast(f"已删除 {success_count} 个数据集")
                     st.session_state['raw_datasets'] = get_raw_datasets()
-                    st.rerun()
+
+            ui.confirm_delete(
+                "delete_selected_raw_datasets",
+                f"{len(selected_names)} 个原始数据集",
+                delete_selected_raw_datasets,
+            )
     
     # Navigation (Click to enter)
     # Since we can't detect click on row in data_editor easily to trigger action without rerun check,
@@ -439,7 +445,7 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
         return
 
     # Fetch files
-    files_data = get_raw_files(current_ds['path'])
+    files_data = get_raw_files(current_ds['id'])
     files = files_data.get('files', [])
     visible_files = files[:MAX_RAW_FILE_ROWS]
     
@@ -477,7 +483,7 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
     with col_pre:
         if st.button("⚙️ 开始预处理", type="primary", width="stretch"):
              with st.spinner(f"正在提交预处理任务..."):
-                ok, res = start_preprocessing(current_ds['path'])
+                ok, res = start_preprocessing(current_ds['id'])
                 if ok:
                     invalidate("datasets", "raw_datasets")
                     st.success(f"任务已提交! ID: {res['task_id']}")
@@ -542,15 +548,22 @@ def _render_dataset_view(ds_name, c_copy, c_paste, c_del, c_import):
         
         with c_del:
             if not selected_files.empty:
-                if st.button("🗑️ 删除", type="primary", width="stretch"):
+                selected_file_names = selected_files["Name"].tolist()
+
+                def delete_selected_raw_files() -> None:
                     success_count = 0
-                    for _, row in selected_files.iterrows():
-                        ok, _ = delete_raw_file(ds_name, row['Name'])
+                    for filename in selected_file_names:
+                        ok, _ = delete_raw_file(ds_name, filename)
                         if ok: success_count += 1
                     if success_count > 0:
                         invalidate("datasets", "raw_datasets")
                         st.toast(f"已删除 {success_count} 个文件")
-                        st.rerun()
+
+                ui.confirm_delete(
+                    f"delete_raw_files_{ds_name}",
+                    f"数据集“{ds_name}”中的 {len(selected_file_names)} 个文件",
+                    delete_selected_raw_files,
+                )
     else:
         st.info("暂无文件，请导入。")
         # Empty clipboard/paste logic even if no files
@@ -578,7 +591,7 @@ def render_processed_explorer():
     is_root = len(current_path) == 0
     
     # --- Breadcrumbs & Header ---
-    path_str = " 🏠 Home"
+    path_str = " 🏠 首页"
     if not is_root:
         # Get dataset name from ID
         datasets = st.session_state.get('datasets_list', [])
@@ -648,16 +661,23 @@ def _render_processed_root_view(c_rename, c_del, c_split):
 
     with c_del:
         if not selected_rows.empty:
-            if st.button("🗑️ 删除", key="del_proc_root_btn", type="primary", width="stretch"):
+            selected_dataset_ids = selected_rows["ID"].tolist()
+
+            def delete_selected_processed_datasets() -> None:
                  count = 0
-                 for _, row in selected_rows.iterrows():
-                     ok, _ = delete_dataset(row['ID'])
+                 for dataset_id in selected_dataset_ids:
+                     ok, _ = delete_dataset(dataset_id)
                      if ok: count += 1
                  if count > 0:
                      invalidate("datasets", "raw_datasets")
                      st.toast(f"已删除 {count} 个数据集")
                      st.session_state['datasets_list'] = get_datasets()
-                     st.rerun()
+
+            ui.confirm_delete(
+                "delete_selected_processed_datasets",
+                f"{len(selected_dataset_ids)} 个已预处理数据集",
+                delete_selected_processed_datasets,
+            )
 
     # Rename Modal Logic
     if st.session_state.get('renaming_proc_ds'):
@@ -720,9 +740,17 @@ def _render_processed_dataset_view(dataset_id, c_del, c_split):
             st.markdown("##### 数据集划分")
             train_ratio = st.slider("训练集比例", 0.1, 0.9, 0.7, 0.05, key="tr_modal")
             val_ratio = st.slider("验证集比例", 0.05, 0.4, 0.15, 0.05, key="vr_modal")
-            st.caption(f"测试集比例: {1.0 - train_ratio - val_ratio:.2f}")
+            split_seed = st.number_input("随机种子", min_value=0, max_value=2_147_483_647, value=42, step=1, key="split_seed")
+            test_ratio = 1.0 - train_ratio - val_ratio
+            if test_ratio <= 0:
+                st.error("训练集与验证集比例之和必须小于 1。")
+            else:
+                st.caption(f"测试集比例: {test_ratio:.2f}；训练任务会读取并复用本次划分配置。")
             if st.button("确认划分", type="primary"):
-                 ok, res = split_dataset(ds['id'], train_ratio, val_ratio)
+                 if test_ratio <= 0:
+                     st.error("请调整比例后再保存。")
+                     return
+                 ok, res = split_dataset(ds['id'], train_ratio, val_ratio, split_seed)
                  if ok:
                      invalidate("datasets", "raw_datasets")
                      st.success(f"划分成功! Train: {res['splits']['train']}, Val: {res['splits']['val']}, Test: {res['splits']['test']}")
@@ -764,25 +792,32 @@ def _render_processed_dataset_view(dataset_id, c_del, c_split):
         
         with c_del:
             if not selected_samples.empty:
-                if st.button("🗑️ 删除样本", type="primary", width="stretch"):
+                selected_report_ids = selected_samples["Report ID"].tolist()
+
+                def delete_selected_samples() -> None:
                     count = 0
-                    for _, row in selected_samples.iterrows():
-                        ok, _ = delete_graph(dataset_id, row['Report ID'])
+                    for report_id in selected_report_ids:
+                        ok, _ = delete_graph(dataset_id, report_id)
                         if ok: count += 1
                     if count > 0:
                         invalidate("datasets", "raw_datasets")
                         st.toast(f"已删除 {count} 个样本")
                         # Refresh dataset info (requires backend call)
                         st.session_state['datasets_list'] = get_datasets()
-                        st.rerun()
+
+                ui.confirm_delete(
+                    f"delete_samples_{dataset_id}",
+                    f"数据集中的 {len(selected_report_ids)} 个样本",
+                    delete_selected_samples,
+                )
     else:
         st.info("该数据集无详细样本信息 (可能是旧版本数据或非图数据集)。")
 
 
 def render_datasets():
-    ui.page_header("数据集管理", "Dataset & Samples Management", icon="fa-database")
+    ui.page_header("数据集管理", "数据集与样本管理", icon="fa-database")
 
-    tab_processed, tab_raw = st.tabs(["📦 已预处理数据集 (Processed)", "📂 未处理数据集 (Raw)"])
+    tab_processed, tab_raw = st.tabs(["📦 已预处理数据集", "📂 原始数据集"])
 
     # ==========================================
     # Tab 1: Processed Datasets

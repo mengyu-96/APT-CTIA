@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import html
 import logging
 import math
@@ -23,6 +24,11 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Image, LongTable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+try:
+    from backend.core.report_options import normalize_report_options
+except ImportError:
+    from core.report_options import normalize_report_options  # type: ignore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -162,7 +168,11 @@ class ReportGenerator:
         task_id: str,
         analysis_results: Dict[str, Any],
         output_filename: str = "report.pdf",
+        report_options: Optional[Dict[str, Any]] = None,
     ) -> str:
+        options = normalize_report_options(report_options)
+        selected_sections = set(options["sections"])
+        redact_identifiers = bool(options["redact_identifiers"])
         pdf_path = self.output_dir / output_filename
         doc = SimpleDocTemplate(
             str(pdf_path),
@@ -209,34 +219,52 @@ class ReportGenerator:
             )
 
         story: List[Any] = []
-        story.extend(self._build_cover(task_id, total_samples))
-        story.extend(
-            self._build_summary_section(
-                top_attr=top_attr,
-                top_score=top_score,
-                total_samples=total_samples,
-                confidence_stats=confidence_stats,
-                dominant_signal=dominant_signal,
-                common_techniques=common_techniques,
+        story.extend(self._build_cover(task_id, total_samples, options, redact_identifiers))
+        if "executive_summary" in selected_sections:
+            story.extend(
+                self._build_summary_section(
+                    top_attr=top_attr,
+                    top_score=top_score,
+                    total_samples=total_samples,
+                    confidence_stats=confidence_stats,
+                    dominant_signal=dominant_signal,
+                    common_techniques=common_techniques,
+                )
             )
-        )
-        story.extend(self._build_overview_metrics(distribution, total_samples, confidence_stats))
-        story.extend(self._build_attribution_distribution(distribution, total_samples))
-        story.extend(self._build_decision_section(explanation, common_entities, common_techniques))
-        if graph_img:
+            story.extend(self._build_overview_metrics(distribution, total_samples, confidence_stats))
+        if "attribution_conclusion" in selected_sections:
+            story.extend(self._build_attribution_distribution(distribution, total_samples))
+        if "feature_analysis" in selected_sections:
+            story.extend(self._build_decision_section(explanation, common_entities, common_techniques))
+        if graph_img and "evidence_graph" in selected_sections:
             story.extend(self._build_graph_section(graph_img))
-        story.extend(self._build_representative_samples(representative_samples, section_number=6 if graph_img else 5))
-        story.extend(self._build_appendix(result_records))
+        if "sample_analysis" in selected_sections:
+            story.extend(self._build_representative_samples(representative_samples, section_number=6 if graph_img else 5))
+            story.extend(self._build_appendix(result_records, redact_identifiers=redact_identifiers))
+        if "iocs" in selected_sections:
+            story.extend(self._build_ioc_appendix(result_records, redact_identifiers=redact_identifiers))
 
         doc.build(story, onFirstPage=self._draw_page_number, onLaterPages=self._draw_page_number)
         LOGGER.info("Report generated successfully: %s", pdf_path)
         return str(pdf_path)
 
-    def _build_cover(self, task_id: str, total_samples: int) -> List[Any]:
+    def _build_cover(
+        self,
+        task_id: str,
+        total_samples: int,
+        options: dict[str, Any],
+        redact_identifiers: bool,
+    ) -> List[Any]:
+        title_map = {
+            "full": "APT 归因综合研判报告",
+            "technical": "APT 归因技术分析报告",
+            "executive": "APT 归因高管摘要",
+        }
+        display_task_id = self._redact_id(task_id) if redact_identifiers else task_id
         return [
             Spacer(1, 0.75 * inch),
-            Paragraph("APT 归因综合研判报告", self.styles["CNTitle"]),
-            Paragraph(f"任务 ID: {_escape(task_id)}", self.styles["CNBody"]),
+            Paragraph(title_map[options["report_type"]], self.styles["CNTitle"]),
+            Paragraph(f"任务 ID: {_escape(display_task_id)}", self.styles["CNBody"]),
             Paragraph(f"样本总量: {total_samples}", self.styles["CNBody"]),
             Paragraph(
                 f"生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -292,12 +320,12 @@ class ReportGenerator:
         return [Paragraph("2. 总体概览", self.styles["CNH1"]), self._build_table(rows, [1.4 * inch, 1.4 * inch, 3.4 * inch])]
 
     def _build_attribution_distribution(self, distribution: dict[str, int], total_samples: int) -> List[Any]:
-        rows = [["APT组织", "样本数", "占比", "风险判断"]]
+        rows = [["APT组织", "样本数", "占比", "分布等级"]]
         ordered = sorted(distribution.items(), key=lambda item: item[1], reverse=True)
         for index, (name, count) in enumerate(ordered[:12], start=1):
             ratio = count / total_samples if total_samples else 0.0
-            risk = "高" if index <= 2 or ratio >= 0.15 else "中" if ratio >= 0.08 else "低"
-            rows.append([name, str(count), f"{ratio:.2%}", risk])
+            level = "主导" if index <= 2 or ratio >= 0.15 else "次要" if ratio >= 0.08 else "低频"
+            rows.append([name, str(count), f"{ratio:.2%}", level])
         story = [Paragraph("3. 归因分布", self.styles["CNH1"])]
         story.append(
             Paragraph(
@@ -468,7 +496,7 @@ class ReportGenerator:
                     story.append(Paragraph(_escape(line), self.styles["CNBodySmall"]))
         return story
 
-    def _build_appendix(self, records: list[dict[str, Any]]) -> List[Any]:
+    def _build_appendix(self, records: list[dict[str, Any]], *, redact_identifiers: bool = False) -> List[Any]:
         story = [Paragraph("附录 A. 样本明细", self.styles["CNH1"])]
         rows = [["样本ID", "预测组织", "置信度", "Top-2 候选"]]
         for item in self._top_records(records, limit=20):
@@ -478,7 +506,7 @@ class ReportGenerator:
             )
             rows.append(
                 [
-                    str(item.get("report_id", "")),
+                    self._redact_id(item.get("report_id", "")) if redact_identifiers else str(item.get("report_id", "")),
                     str(item.get("predicted_label", "")),
                     f"{_safe_float(item.get('confidence')):.2%}",
                     alt,
@@ -492,6 +520,46 @@ class ReportGenerator:
         )
         story.append(self._build_table(rows, [2.0 * inch, 1.3 * inch, 0.9 * inch, 2.2 * inch], small=True))
         return story
+
+    def _build_ioc_appendix(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        redact_identifiers: bool = False,
+    ) -> List[Any]:
+        ioc_types = {
+            "IP", "DOMAIN", "URL", "EMAIL", "HOSTNAME", "PORT",
+            "HASH", "HASH_MD5", "HASH_SHA1", "HASH_SHA256",
+            "FILE_NAME", "FILE_PATH", "REGISTRY", "MUTEX",
+        }
+        rows = [["IOC", "类型", "来源样本"]]
+        seen: set[tuple[str, str]] = set()
+        for record in records:
+            report_id = str(record.get("report_id", ""))
+            if redact_identifiers:
+                report_id = self._redact_id(report_id)
+            explanation = record.get("explanation") or {}
+            for node in explanation.get("key_nodes", []) or []:
+                node_type = str(node.get("type", "")).upper()
+                value = str(node.get("text", "")).strip()
+                key = (node_type, value)
+                if node_type in ioc_types and value and key not in seen:
+                    seen.add(key)
+                    rows.append([value, node_type, report_id])
+                if len(rows) >= 51:
+                    break
+            if len(rows) >= 51:
+                break
+        story = [Paragraph("附录 B. IOC 清单", self.styles["CNH1"])]
+        if len(rows) == 1:
+            story.append(Paragraph("当前结果中没有可导出的高置信 IOC。", self.styles["CNBody"]))
+        else:
+            story.append(self._build_table(rows, [3.0 * inch, 1.2 * inch, 2.0 * inch], small=True))
+        return story
+
+    @staticmethod
+    def _redact_id(value: Any) -> str:
+        return f"ID-{hashlib.sha256(str(value).encode('utf-8')).hexdigest()[:12]}"
 
     def _build_table(self, rows: List[List[str]], widths: List[float], *, small: bool = False) -> Table:
         available_width = A4[0] - 84

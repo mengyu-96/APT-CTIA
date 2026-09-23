@@ -1,31 +1,70 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
 from pathlib import Path
+import time
 
 import streamlit as st
 from streamlit_option_menu import option_menu
 
 from apt_ui.pages.attribution import render_attribution
+from apt_ui.pages.audit import render_audit_log
 from apt_ui.pages.clustering import render_clustering
 from apt_ui.pages.datasets import render_datasets
 from apt_ui.pages.features import render_features
 from apt_ui.pages.models import render_models
 from apt_ui.pages.report import render_report
+from apt_ui.pages.threat_actors import render_threat_actors
 from apt_ui.pages.upload import render_upload
-from apt_ui.services.api_client import get_dashboard_counts
+from apt_ui.services.api_client import get_dashboard_counts, get_system_health
 from apt_ui.services import ui
+from apt_ui.services.security import UserStore, load_auth_config, verify_credentials
+from apt_ui.services.streamlit_compat import install_streamlit_width_compatibility
 
 
-AUTH_QUERY_KEY = "auth"
-AUTH_ENABLED = os.getenv("ENABLE_UI_AUTH", "true").strip().lower() in {"1", "true", "yes", "on"}
-AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
-AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "admin")
-AUTH_SECRET = os.getenv("AUTH_SESSION_SECRET", "rgapt-session-secret")
-SYSTEM_NAME = "GRACE"
-SYSTEM_SUBTITLE = "基于多层异构图与双流学习的APT威胁情报归因系统"
+AUTH_CONFIG = load_auth_config(os.environ)
+AUTH_USER_STORE = UserStore(AUTH_CONFIG.users_file)
+install_streamlit_width_compatibility(st)
+SYSTEM_NAME = "HERA"
+SYSTEM_SUBTITLE = "基于异构证据推理与语义—结构双流学习的APT组织归因平台"
+SYSTEM_SUBTITLE_EN = (
+    "APT Organization Attribution Platform Based on Heterogeneous Evidence "
+    "Reasoning and Semantic-Structural Dual-stream Learning"
+)
+MENU_ENTRIES = [
+    ("home", "主页", "house"),
+    ("tasks", "预处理任务管理", "list-task"),
+    ("datasets", "数据集管理", "database"),
+    ("features", "特征提取与可视化", "bar-chart"),
+    ("training", "模型训练", "diagram-3"),
+    ("models", "模型管理", "cpu"),
+    ("attribution", "APT归因结果", "bullseye"),
+    ("actors", "APT组织情报库", "person-badge"),
+    ("report", "报告生成与导出", "file-text"),
+    ("audit", "审计日志", "clipboard-check"),
+]
+PAGE_BY_MENU_LABEL = {label: page for page, label, _ in MENU_ENTRIES}
+MENU_LABEL_BY_PAGE = {page: label for page, label, _ in MENU_ENTRIES}
+
+
+def _sync_navigation_from_widget(key: str) -> None:
+    selected_page = PAGE_BY_MENU_LABEL.get(st.session_state.get(key))
+    if selected_page is None:
+        return
+    st.session_state["_main_navigation_page"] = selected_page
+    st.query_params["page"] = selected_page
+
+
+def _finish_authentication(username: str) -> None:
+    """Start every new login on the home page, including stale shared links."""
+
+    st.session_state["password_correct"] = True
+    st.session_state["authenticated_at"] = time.time()
+    st.session_state["auth_username"] = username
+    st.session_state["main_navigation"] = MENU_LABEL_BY_PAGE["home"]
+    st.session_state["_main_navigation_page"] = "home"
+    st.query_params["page"] = "home"
+    st.rerun()
 
 
 @st.cache_data(show_spinner=False)
@@ -35,131 +74,111 @@ def _read_css(file_path: str, mtime_ns: int) -> str:
         return f.read()
 
 
-def _get_query_params() -> dict[str, list[str]]:
-    params: dict[str, list[str]] = {}
-    for key in st.query_params:
-        values = st.query_params.get_all(key)
-        if values:
-            params[key] = values
-    return params
-
-
-def _set_query_params(params: dict[str, list[str] | str]) -> None:
-    st.query_params.from_dict(params)
-
-
-def _auth_signature(username: str) -> str:
-    return hmac.new(
-        AUTH_SECRET.encode("utf-8"),
-        username.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _build_auth_token(username: str) -> str:
-    return f"{username}:{_auth_signature(username)}"
-
-
-def _is_valid_auth_token(token: str | None) -> bool:
-    if not token or ":" not in token:
-        return False
-    username, signature = token.split(":", 1)
-    if username != AUTH_USERNAME:
-        return False
-    return hmac.compare_digest(signature, _auth_signature(username))
-
-
-def _get_auth_token_from_query() -> str | None:
-    params = _get_query_params()
-    values = params.get(AUTH_QUERY_KEY, [])
-    return values[0] if values else None
-
-
-def _set_auth_token(token: str | None) -> None:
-    params = _get_query_params()
-    if token:
-        if params.get(AUTH_QUERY_KEY, [None])[0] == token:
-            return
-        params[AUTH_QUERY_KEY] = token
-    else:
-        if AUTH_QUERY_KEY not in params:
-            return
-        params.pop(AUTH_QUERY_KEY, None)
-    _set_query_params(params)
-
-
 def check_password() -> bool:
-    """Returns `True` if the user had a correct password."""
+    """Authenticate the current Streamlit session without URL credentials."""
 
-    if not AUTH_ENABLED:
+    if not AUTH_CONFIG.enabled:
+        st.session_state.setdefault("auth_username", "本地预览")
         return True
+    if AUTH_CONFIG.error:
+        st.error(f"登录功能配置错误：{AUTH_CONFIG.error}")
+        st.caption("请修改部署环境变量后重新启动前端服务。")
+        return False
+    if st.session_state.get("password_correct"):
+        authenticated_at = float(st.session_state.get("authenticated_at", 0) or 0)
+        if time.time() - authenticated_at < AUTH_CONFIG.session_ttl_seconds:
+            return True
+        st.session_state.pop("password_correct", None)
+        st.session_state.pop("authenticated_at", None)
+        st.warning("登录会话已过期，请重新登录。")
 
-    def password_entered() -> None:
-        if (
-            st.session_state["username"] == AUTH_USERNAME
-            and st.session_state["password"] == AUTH_PASSWORD
-        ):
-            st.session_state["password_correct"] = True
-            _set_auth_token(_build_auth_token(AUTH_USERNAME))
-            del st.session_state["password"]
-            del st.session_state["username"]
+    _, login_col, _ = st.columns([1, 2, 1])
+    with login_col:
+        auth_slot = st.empty()
+        auth_view = st.session_state.setdefault("auth_view", "login")
+        previous_auth_view = st.session_state.get("_rendered_auth_view")
+        if previous_auth_view is not None and previous_auth_view != auth_view:
+            # Send the deletion in its own run. Replacing the container in the
+            # same run leaves the old form's trailing elements in the DOM.
+            auth_slot.empty()
+            st.session_state["_rendered_auth_view"] = auth_view
+            st.rerun()
+        st.session_state["_rendered_auth_view"] = auth_view
+        with auth_slot.container():
+            _render_auth_form()
+    return False
+
+
+def _render_auth_form() -> None:
+        st.markdown(
+            """
+            <div class="login-hero">
+                <div class="login-icon"><i class="fas fa-shield-alt"></i></div>
+                <div class="login-brand-title">{SYSTEM_NAME}</div>
+                <p>{SYSTEM_SUBTITLE}</p>
+                <p class="login-subtitle-en">{SYSTEM_SUBTITLE_EN}</p>
+            </div>
+            """.format(
+                SYSTEM_NAME=SYSTEM_NAME,
+                SYSTEM_SUBTITLE=SYSTEM_SUBTITLE,
+                SYSTEM_SUBTITLE_EN=SYSTEM_SUBTITLE_EN,
+            ),
+            unsafe_allow_html=True,
+        )
+        st.session_state.setdefault("auth_view", "login")
+        if st.session_state.auth_view == "login":
+            with st.form("login_form"):
+                username = st.text_input("Username", key="login_username")
+                password = st.text_input("Password", type="password", key="login_password")
+                submitted = st.form_submit_button(
+                    "Login", type="primary", use_container_width=True
+                )
+            if submitted:
+                if verify_credentials(username, password, AUTH_CONFIG, AUTH_USER_STORE):
+                    st.session_state.pop("login_password", None)
+                    st.session_state.pop("login_username", None)
+                    _finish_authentication(username.strip())
+                st.session_state["password_correct"] = False
+            if st.session_state.get("password_correct") is False:
+                st.error("用户名或密码不正确。")
+            if AUTH_CONFIG.allow_registration:
+                switch_label_col, switch_action_col = st.columns([1, 1], gap="small")
+                with switch_label_col:
+                    st.markdown('<div class="auth-switch-label">没有账号？</div>', unsafe_allow_html=True)
+                with switch_action_col:
+                    st.markdown('<span class="auth-switch-action-anchor"></span>', unsafe_allow_html=True)
+                    if st.button("注册账号", key="show_registration", use_container_width=False):
+                        st.session_state.auth_view = "register"
+                        st.rerun()
         else:
-            st.session_state["password_correct"] = False
-            _set_auth_token(None)
-
-    if _is_valid_auth_token(_get_auth_token_from_query()):
-        st.session_state["password_correct"] = True
-        return True
-
-    if "password_correct" not in st.session_state:
-        c1, c2, c3 = st.columns([1, 2, 1])
-        with c2:
-            st.markdown(
-                """
-                <div style="text-align: center; margin-bottom: 2rem; margin-top: 5rem;">
-                    <div style="font-size: 4rem; margin-bottom: 1rem; color: #00d4ff; filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.5));">
-                        <i class="fas fa-shield-alt"></i>
-                    </div>
-                    <h1 style="color: #00d4ff; letter-spacing: 2px;">{SYSTEM_NAME}</h1>
-                    <p style="color: #a0aab5;">{SYSTEM_SUBTITLE}</p>
-                    <p style="color: #a0aab5; font-size: 0.95em; line-height: 1.5;">{SYSTEM_SUBTITLE_EN}</p>
-                </div>
-                """.format(SYSTEM_NAME=SYSTEM_NAME,SYSTEM_SUBTITLE=SYSTEM_SUBTITLE, SYSTEM_SUBTITLE_EN="Graph-based APT Cyber Threat IntElligence Attribution System Based on Multi-layer Heterogeneous Graph and Dual-stream Learning"),
-                unsafe_allow_html=True,
-            )
-
-            st.text_input("Username", key="username")
-            st.text_input("Password", type="password", key="password")
-            st.button("Login", on_click=password_entered, type="primary", width="stretch")
-            #if AUTH_USERNAME == "admin" and AUTH_PASSWORD == "admin":
-                #st.info("Default: admin / admin")
-
-        return False
-
-    if not st.session_state["password_correct"]:
-        c1, c2, c3 = st.columns([1, 2, 1])
-        with c2:
-            st.markdown(
-                """
-                <div style="text-align: center; margin-bottom: 2rem; margin-top: 5rem;">
-                    <div style="font-size: 4rem; margin-bottom: 1rem; color: #00d4ff;">
-                        <i class="fas fa-shield-alt"></i>
-                    </div>
-                    <h1 style="color: #00d4ff; letter-spacing: 2px;">{SYSTEM_NAME}</h1>
-                    <p style="color: #a0aab5;">{SYSTEM_SUBTITLE}</p>
-                    <p style="color: #6c757d; font-size: 0.9em;">{SYSTEM_SUBTITLE}</p>
-                </div>
-                """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
-                unsafe_allow_html=True,
-            )
-
-            st.text_input("Username", key="username")
-            st.text_input("Password", type="password", key="password")
-            st.button("Login", on_click=password_entered, type="primary", width="stretch")
-            st.error("😕 User not known or password incorrect")
-        return False
-
-    return True
+            st.markdown('<div class="auth-register-title">注册账号</div>', unsafe_allow_html=True)
+            with st.form("registration_form"):
+                new_username = st.text_input("Username", key="register_username")
+                new_password = st.text_input("Password", type="password", key="register_password")
+                confirm_password = st.text_input(
+                    "Confirm password",
+                    type="password",
+                    key="register_password_confirm",
+                )
+                registered = st.form_submit_button(
+                    "Create account", type="primary", use_container_width=True
+                )
+            st.caption("用户名为 3–32 个字符；密码至少 12 个字符。")
+            if registered:
+                if new_password != confirm_password:
+                    st.error("两次输入的密码不一致。")
+                elif AUTH_CONFIG.username and new_username.strip().casefold() == AUTH_CONFIG.username.casefold():
+                    st.error("该用户名已存在。")
+                else:
+                    try:
+                        account = AUTH_USER_STORE.register(new_username, new_password)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        _finish_authentication(account["username"])
+            if st.button("返回登录", key="show_login", use_container_width=True):
+                st.session_state.auth_view = "login"
+                st.rerun()
 
 
 def load_css(file_path: Path) -> None:
@@ -167,24 +186,57 @@ def load_css(file_path: Path) -> None:
     st.markdown(f'<style>{_read_css(str(file_path), stat.st_mtime_ns)}</style>', unsafe_allow_html=True)
 
 
+@st.dialog("软件说明", width="large")
+def render_software_guide() -> None:
+    st.markdown(
+        """
+        **快速开始**
+
+        1. 登录已有账号，或通过“注册账号”创建新账号。
+        2. 在“预处理任务管理”中填写数据集名称，上传 TXT、JSON 或 PDF 文件并提交任务。
+        3. 任务完成后，在“数据集管理”中检查处理结果；如页面未更新，可点击“刷新”。
+        4. 在“特征提取与可视化”中查看实体、关系和图结构统计。
+        5. 在“模型训练”中选择数据集和训练参数，提交任务后从任务记录查看结果。
+        6. 在“APT归因结果”中选择模型和待分析数据，核对候选组织、置信度与解释证据。
+        7. 在“报告生成与导出”中选择归因结果，生成并下载分析报告。
+
+        **其他功能**
+
+        - “模型管理”用于查看、比较和维护训练模型。
+        - “APT组织情报库”用于查询组织别名、常用工具和 TTP。
+        - “审计日志”记录分析师的复核与关键操作。
+        - 退出账号请展开左侧底部的“会话管理”，然后点击“退出登录”。
+        """
+    )
+
+
+def render_software_guide_entry() -> None:
+    st.markdown('<span class="software-guide-anchor"></span>', unsafe_allow_html=True)
+    if st.button("软件说明", key="software_guide_button"):
+        render_software_guide()
+
+
 FEATURE_MODULES = [
-    ("fa-tasks", "任务管理", "分析任务与预处理"),
-    ("fa-chart-bar", "特征提取", "多维特征可视化"),
-    ("fa-project-diagram", "模型训练", "多层异构图与双流学习"),
-    ("fa-bullseye", "APT 归因", "攻击组织溯源"),
-    ("fa-stream", "归因记录", "历史结果与解释证据"),
-    ("fa-database", "数据集", "样本数据管理"),
-    ("fa-file-alt", "报告生成", "分析报告导出"),
-    ("fa-brain", "模型管理", "算法模型管理"),
+    ("fa-tasks", "任务管理", "分析任务与预处理", "blue"),
+    ("fa-chart-bar", "特征提取", "多维特征可视化", "purple"),
+    ("fa-project-diagram", "模型训练", "多层异构图与双流学习", "indigo"),
+    ("fa-bullseye", "APT 归因", "攻击组织溯源", "warning"),
+    ("fa-user-secret", "组织情报库", "组织画像、工具与 TTP", "cyan"),
+    ("fa-stream", "归因记录", "历史结果与解释证据", "warning"),
+    ("fa-database", "数据集", "样本数据管理", "cyan"),
+    ("fa-file-alt", "报告生成", "分析报告导出", "success"),
+    ("fa-brain", "模型管理", "算法模型管理", "purple"),
+    ("fa-clipboard-list", "审计日志", "分析师复核留痕", "blue"),
 ]
 
 
-def _feature_card(icon: str, title: str, desc: str) -> str:
+def _feature_card(icon: str, title: str, desc: str, tone: str) -> str:
     return (
-        f'<div class="feature-module">'
-        f'<i class="fas {icon}"></i>'
-        f'<h3>{title}</h3>'
+        f'<div class="feature-module feature-module--{tone}">'
+        f'<div class="feature-module-icon"><i class="fas {icon}"></i></div>'
+        f'<div class="feature-module-title">{title}</div>'
         f'<p>{desc}</p>'
+        f'<span class="feature-module-arrow" aria-hidden="true">→</span>'
         f"</div>"
     )
 
@@ -202,29 +254,39 @@ def _stat_card(icon: str, value: object, label: str) -> str:
 def render_home() -> None:
     st.markdown(
         """
-        <div style="text-align: center; margin: 1rem 0 2.6rem 0; padding: 2.4rem 1rem;
-             background: linear-gradient(160deg, rgba(8,32,52,0.6), rgba(4,20,33,0.4));
-             border: 1px solid var(--border-color); border-radius: 16px;">
-            <div style="font-size: 2.6rem; color: #00d4ff; margin-bottom: 0.6rem;
-                 filter: drop-shadow(0 0 12px rgba(0,212,255,0.4));">
-                <i class="fas fa-shield-alt"></i>
+        <section class="home-hero">
+            <div class="home-hero__content">
+                <div class="home-hero__eyebrow"><i class="fas fa-shield-alt"></i><span>APT INTELLIGENCE PLATFORM</span></div>
+                <div class="home-brand-title">{SYSTEM_NAME}</div>
+                <p class="home-hero__headline">面向高级持续性威胁的智能分析与攻击组织归因平台</p>
+                <p class="home-hero__subtitle">{SYSTEM_SUBTITLE}</p>
+                <p class="home-hero__description">覆盖威胁情报预处理、特征建模、模型训练、APT归因与报告生成。</p>
             </div>
-            <h1 style="font-size: 1.7rem; margin: 0 0 0.4rem 0;">{SYSTEM_NAME}</h1>
-            <p style="color: #00d4ff; opacity: 0.75; letter-spacing: 1.5px;
-               font-size: 0.9rem; margin: 0 0 1.2rem 0;">{SYSTEM_SUBTITLE}</p>
-            <p style="font-size: 1rem; color: var(--text-muted); max-width: 760px; margin: 0 auto; line-height: 1.7;">
-                帮助安全专家快速、准确地识别与分析高级持续性威胁，集成特征提取、模型训练与APT威胁情报归因能力。
-            </p>
-        </div>
+            <div class="home-hero__visual" aria-hidden="true">
+                <div class="threat-network">
+                    <span class="network-ring network-ring--one"></span>
+                    <span class="network-ring network-ring--two"></span>
+                    <span class="network-line network-line--one"></span>
+                    <span class="network-line network-line--two"></span>
+                    <span class="network-line network-line--three"></span>
+                    <span class="network-node network-node--core"><i class="fas fa-shield-halved"></i></span>
+                    <span class="network-node network-node--one"></span>
+                    <span class="network-node network-node--two"></span>
+                    <span class="network-node network-node--three"></span>
+                    <span class="network-node network-node--four"></span>
+                </div>
+                <div class="network-caption"><span></span>异构证据关联分析</div>
+            </div>
+        </section>
         """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
         unsafe_allow_html=True,
     )
 
     st.markdown('<div class="section-title"><i class="fas fa-th-large"></i><span>核心功能</span></div>', unsafe_allow_html=True)
-    for row_start in range(0, len(FEATURE_MODULES), 4):
-        cols = st.columns(4)
-        for col, (icon, title, desc) in zip(cols, FEATURE_MODULES[row_start:row_start + 4]):
-            col.markdown(_feature_card(icon, title, desc), unsafe_allow_html=True)
+    for row_start in range(0, len(FEATURE_MODULES), 5):
+        cols = st.columns(5)
+        for col, (icon, title, desc, tone) in zip(cols, FEATURE_MODULES[row_start:row_start + 5]):
+            col.markdown(_feature_card(icon, title, desc, tone), unsafe_allow_html=True)
 
     st.markdown("<div style='height: 1.6rem;'></div>", unsafe_allow_html=True)
     st.markdown('<div class="section-title"><i class="fas fa-gauge-high"></i><span>系统资源概览</span></div>', unsafe_allow_html=True)
@@ -234,14 +296,13 @@ def render_home() -> None:
         ("fa-database", counts["datasets"], "数据集"),
         ("fa-brain", counts["models"], "已训练模型"),
         ("fa-stream", counts["results"], "归因结果"),
-        ("fa-check-circle", "Ready", "系统状态"),
+        ("fa-check-circle", get_system_health(), "系统状态"),
     ]
     for col, (icon, value, label) in zip(st.columns(4), cards):
         col.markdown(_stat_card(icon, value, label), unsafe_allow_html=True)
 
 
 def _clear_session() -> None:
-    _set_auth_token(None)
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     st.rerun()
@@ -252,7 +313,7 @@ def main() -> None:
         page_title=SYSTEM_NAME,
         page_icon="🛡️",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="auto",
     )
 
     st.markdown(
@@ -260,31 +321,32 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    if not check_password():
-        return
-
     css_file = Path(__file__).parent / "css" / "styles.css"
     if css_file.exists():
         load_css(css_file)
+    ui.apply_accessibility_metadata()
+    render_software_guide_entry()
 
-    menu_entries = [
-        ("home", "主页", "house"),
-        ("tasks", "预处理任务管理", "list-task"),
-        ("datasets", "数据集管理", "database"),
-        ("features", "特征提取与可视化", "bar-chart"),
-        ("training", "模型训练", "diagram-3"),
-        ("models", "模型管理", "cpu"),
-        ("attribution", "APT归因结果", "bullseye"),
-        ("report", "报告生成与导出", "file-text"),
-    ]
+    if not check_password():
+        return
+
+    valid_pages = {item[0] for item in MENU_ENTRIES}
+    requested_page = st.query_params.get("page", "home")
+    if requested_page not in valid_pages:
+        requested_page = "home"
+    default_index = next(i for i, item in enumerate(MENU_ENTRIES) if item[0] == requested_page)
+
+    if st.session_state.get("_main_navigation_page") != requested_page:
+        st.session_state["main_navigation"] = MENU_LABEL_BY_PAGE[requested_page]
+        st.session_state["_main_navigation_page"] = requested_page
 
     with st.sidebar:
         st.markdown(
             """
-            <div style="text-align: center; margin-bottom: 2rem; padding: 1rem 0;">
-                <div style="font-size: 3rem; margin-bottom: 0.5rem; color: #00d4ff; filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.5));"><i class="fas fa-shield-alt"></i></div>
-                <h2 style="margin:0; color: white; letter-spacing: 2px;">{SYSTEM_NAME}</h2>
-                <p style="color: #00d4ff; font-size: 0.8rem; letter-spacing: 1px; opacity: 0.8;">{SYSTEM_SUBTITLE}</p>
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-icon"><i class="fas fa-shield-alt"></i></div>
+                <div class="sidebar-brand-title">{SYSTEM_NAME}</div>
+                <p class="sidebar-brand-subtitle">{SYSTEM_SUBTITLE}</p>
             </div>
             """.format(SYSTEM_NAME=SYSTEM_NAME, SYSTEM_SUBTITLE=SYSTEM_SUBTITLE),
             unsafe_allow_html=True,
@@ -292,26 +354,30 @@ def main() -> None:
 
         selected = option_menu(
             menu_title=None,
-            options=[item[1] for item in menu_entries],
-            icons=[item[2] for item in menu_entries],
+            options=[item[1] for item in MENU_ENTRIES],
+            icons=[item[2] for item in MENU_ENTRIES],
             menu_icon="cast",
-            default_index=0,
+            default_index=default_index,
+            key="main_navigation",
+            on_change=_sync_navigation_from_widget,
             styles={
-                "container": {"padding": "0!important", "background-color": "transparent"},
-                "icon": {"color": "#00d4ff", "font-size": "15px"},
+                "container": {"padding": "0!important", "background-color": "#07131F"},
+                "icon": {"color": "#38BDF8", "font-size": "15px"},
                 "nav-link": {
                     "font-size": "14px",
                     "text-align": "left",
                     "margin": "3px 8px",
                     "padding": "0.55rem 0.8rem",
-                    "color": "#93a4b3",
+                    "color": "#8393A7",
+                    "background-color": "transparent",
+                    "--hover-color": "rgba(56, 189, 248, 0.06)",
                     "border-radius": "8px",
                     "transition": "background-color 0.18s ease, color 0.18s ease",
                 },
                 "nav-link-selected": {
-                    "background-color": "rgba(0, 212, 255, 0.12)",
-                    "color": "#ffffff",
-                    "border-left": "3px solid #00d4ff",
+                    "background-color": "rgba(56, 189, 248, 0.11)",
+                    "color": "#F8FAFC",
+                    "border-left": "3px solid #38BDF8",
                     "font-weight": "600",
                 },
             },
@@ -319,12 +385,31 @@ def main() -> None:
 
         st.divider()
         with st.expander("🔧 会话管理"):
-            st.caption("刷新浏览器后仍会保留当前登录状态，直到主动退出。")
-            if st.button("🗑️ 清空当前会话", type="secondary", width="stretch"):
+            st.caption("登录状态仅保存在当前浏览器会话中，不写入网址。")
+            if st.button("退出登录", type="secondary", use_container_width=True):
                 _clear_session()
 
-    selected_key = next((item[0] for item in menu_entries if item[1] == selected), "home")
+    selected_key = PAGE_BY_MENU_LABEL.get(selected, "home")
+    page_slot = st.empty()
+    if selected_key != requested_page:
+        st.session_state["_main_navigation_page"] = selected_key
+        st.query_params["page"] = selected_key
+        page_slot.empty()
+        st.session_state["_rendered_page"] = selected_key
+        st.rerun()
+    previous_page = st.session_state.get("_rendered_page")
+    if previous_page is not None and previous_page != selected_key:
+        # Clear the old page in a separate run. A same-run replacement can
+        # retain trailing elements from a longer page beneath the new page.
+        page_slot.empty()
+        st.session_state["_rendered_page"] = selected_key
+        st.rerun()
+    st.session_state["_rendered_page"] = selected_key
+    with page_slot.container():
+        _render_page(selected_key)
 
+
+def _render_page(selected_key: str) -> None:
     if selected_key == "home":
         render_home()
     elif selected_key == "tasks":
@@ -341,6 +426,10 @@ def main() -> None:
         render_report()
     elif selected_key == "models":
         render_models()
+    elif selected_key == "actors":
+        render_threat_actors()
+    elif selected_key == "audit":
+        render_audit_log()
 
 
 if __name__ == "__main__":

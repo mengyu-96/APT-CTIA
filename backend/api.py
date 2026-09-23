@@ -1,5 +1,5 @@
 # backend/api.py
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, send_file, abort, Response
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import os
 import shutil
@@ -8,9 +8,9 @@ import logging
 import time
 from typing import Any
 
-from core.preprocess import run_preprocessing_pipeline
-from core.inference import run_inference_pipeline
-from core.report_generator import ReportGenerator
+from core.exports import build_stix_bundle
+from core.report_options import normalize_report_options
+from core.review_store import ReviewStore, VALID_DECISIONS
 from runtime_config import (
     ENABLE_INFERENCE,
     ENABLE_PREPROCESSING,
@@ -31,23 +31,26 @@ RESULTS_ARCHIVE = BASE_DIR / 'results_archive'
 PROCESSED_DATA_DIR = RESULTS_ARCHIVE / 'processed_data'
 TRAINING_RUNS_DIR = RESULTS_ARCHIVE / 'training_runs'
 REPORTS_DIR = RESULTS_ARCHIVE / 'reports'
+REVIEWS_FILE = RESULTS_ARCHIVE / 'analyst_reviews.json'
+AUDIT_LOG_FILE = RESULTS_ARCHIVE / 'audit_log.jsonl'
 RAW_DATA_PATHS = [
     BASE_DIR / 'dataset_TXT',
     BASE_DIR / 'reports'
 ]
 
 ATTRIBUTION_RESULTS_DIR = RESULTS_ARCHIVE / 'attribution_results'
-ATTRIBUTION_RESULTS_DIR.mkdir(exist_ok=True)
+ATTRIBUTION_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 设置 app 配置
 app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
 
 # 确保所有需要的目录都存在
-UPLOAD_FOLDER.mkdir(exist_ok=True)
-RESULTS_ARCHIVE.mkdir(exist_ok=True)
-PROCESSED_DATA_DIR.mkdir(exist_ok=True)
-TRAINING_RUNS_DIR.mkdir(exist_ok=True)
-REPORTS_DIR.mkdir(exist_ok=True)
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+RESULTS_ARCHIVE.mkdir(parents=True, exist_ok=True)
+PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+TRAINING_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+REVIEW_STORE = ReviewStore(REVIEWS_FILE, AUDIT_LOG_FILE)
 
 
 def _feature_disabled_response(feature: str):
@@ -55,6 +58,20 @@ def _feature_disabled_response(feature: str):
         "error": f"{feature} is disabled by server configuration",
         "feature": feature,
     }), 403
+
+
+def _run_preprocessing_pipeline(*args, **kwargs):
+    """Import heavyweight NLP dependencies only when preprocessing starts."""
+    from core.preprocess import run_preprocessing_pipeline
+
+    return run_preprocessing_pipeline(*args, **kwargs)
+
+
+def _run_inference_pipeline(*args, **kwargs):
+    """Import PyTorch and graph dependencies only when inference starts."""
+    from core.inference import run_inference_pipeline
+
+    return run_inference_pipeline(*args, **kwargs)
 
 @app.errorhandler(404)
 def not_found_error(error):
@@ -708,7 +725,6 @@ def list_raw_datasets():
                 datasets.append({
                     "id": item.name,
                     "name": item.name,
-                    "path": str(item),
                     "file_count": file_count,
                     "type": "FileSystem"
                 })
@@ -720,15 +736,15 @@ def list_raw_datasets():
 def list_raw_dataset_files():
     """
     列出原始数据集中的文件。
-    Query param: path
+    Query param: dataset_id
     """
-    path_str = request.args.get('path')
-    if not path_str:
-        return jsonify({"error": "Missing path parameter"}), 400
-        
-    path = Path(path_str)
+    dataset_id = request.args.get('dataset_id', '').strip()
+    if not dataset_id or Path(dataset_id).name != dataset_id:
+        return jsonify({"error": "Invalid dataset_id parameter"}), 400
+
+    path = BASE_DIR / 'dataset_TXT' / dataset_id
     if not path.exists() or not path.is_dir():
-        return jsonify({"error": "Path not found"}), 404
+        return jsonify({"error": "Dataset not found"}), 404
 
     cache_key = f"raw_files:{path}"
     signature = _dir_signature(path)
@@ -743,7 +759,6 @@ def list_raw_dataset_files():
         if p.is_file() and p.suffix.lower() in ['.pdf', '.txt', '.json']:
             files.append({
                 "name": p.name,
-                "path": str(p),
                 "size": p.stat().st_size,
                 "modified": datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
             })
@@ -771,7 +786,7 @@ def create_raw_dataset():
          
     try:
         target_path.mkdir(parents=True)
-        return jsonify({"message": "Dataset created successfully", "path": str(target_path)})
+        return jsonify({"message": "Dataset created successfully", "id": name})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -814,7 +829,7 @@ def rename_raw_dataset(name):
         
     try:
         target_path.rename(new_path)
-        return jsonify({"message": "Renamed successfully", "new_path": str(new_path)})
+        return jsonify({"message": "Renamed successfully", "id": new_name})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -834,7 +849,7 @@ def copy_raw_dataset(name):
         
     try:
         shutil.copytree(target_path, new_path)
-        return jsonify({"message": "Copied successfully", "path": str(new_path)})
+        return jsonify({"message": "Copied successfully", "id": new_name})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -875,7 +890,7 @@ def copy_raw_file(name, filename):
         
     try:
         shutil.copy2(source_path, dest_path)
-        return jsonify({"message": "File copied successfully", "path": str(dest_path)})
+        return jsonify({"message": "File copied successfully", "name": dest_path.name})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -951,7 +966,7 @@ def preprocess_data():
     处理上传的原始日志文件（异步）。
     支持两种模式：
     1. 上传文件 (Multipart form data 'files')
-    2. 指定本地路径 (JSON body 'raw_dataset_path')
+    2. 指定受管原始数据集 (JSON body 'raw_dataset_id')
     """
     if not ENABLE_PREPROCESSING:
         return _feature_disabled_response("preprocessing")
@@ -959,13 +974,13 @@ def preprocess_data():
     # Check for JSON input first (Local Path mode)
     if request.is_json:
         data = request.json
-        raw_dataset_path = data.get('raw_dataset_path')
-        if not raw_dataset_path:
-             return jsonify({"error": "Missing raw_dataset_path"}), 400
-             
-        path = Path(raw_dataset_path)
-        if not path.exists():
-            return jsonify({"error": "Path does not exist"}), 404
+        raw_dataset_id = str(data.get('raw_dataset_id', '')).strip()
+        if not raw_dataset_id or Path(raw_dataset_id).name != raw_dataset_id:
+            return jsonify({"error": "Invalid raw_dataset_id"}), 400
+
+        path = BASE_DIR / 'dataset_TXT' / raw_dataset_id
+        if not path.exists() or not path.is_dir():
+            return jsonify({"error": "Dataset does not exist"}), 404
             
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         
@@ -1017,7 +1032,7 @@ def preprocess_data():
 
                 set_task_fields(task_id, progress=pct, message=msg)
 
-            result_path = run_preprocessing_pipeline(
+            result_path = _run_preprocessing_pipeline(
                 raw_data_dir=path,
                 base_output_dir=output_dir,
                 skip_graphs=False,
@@ -1112,7 +1127,7 @@ def preprocess_data():
 
                     set_task_fields(task_id, progress=pct, message=msg)
 
-                result_path = run_preprocessing_pipeline(
+                result_path = _run_preprocessing_pipeline(
                     raw_data_dir=temp_upload_dir,
                     base_output_dir=output_dir,
                     skip_graphs=False,
@@ -1217,7 +1232,6 @@ def list_datasets():
                         "id": run_dir.name, # Use directory name as ID (timestamp)
                         "name": display_name,
                         "type": "Graph Collection",
-                        "path": str(run_dir),
                         "num_graphs": num_graphs,
                         "created": datetime.datetime.fromtimestamp(run_dir.stat().st_ctime).strftime('%Y-%m-%d %H:%M:%S'),
                         "status": "Ready",
@@ -1424,8 +1438,22 @@ def split_dataset(dataset_id):
     train_ratio = config.get('train_ratio', 0.7)
     val_ratio = config.get('val_ratio', 0.15)
     test_ratio = config.get('test_ratio', 0.15)
+    seed = config.get('seed', 42)
     
     try:
+        train_ratio = float(train_ratio)
+        val_ratio = float(val_ratio)
+        test_ratio = float(test_ratio)
+        seed = int(seed)
+        ratios = (train_ratio, val_ratio, test_ratio)
+        if any(value <= 0 or value >= 1 for value in ratios) or abs(sum(ratios) - 1.0) > 1e-6:
+            return jsonify({"error": "Split ratios must be between 0 and 1 and sum to 1"}), 400
+        config = {
+            "train_ratio": train_ratio,
+            "val_ratio": val_ratio,
+            "test_ratio": test_ratio,
+            "seed": seed,
+        }
         # Load all graphs (or just list them)
         graphs_dir = target_dir / "graphs"
         if graphs_dir.exists() and graphs_dir.is_dir():
@@ -1438,6 +1466,7 @@ def split_dataset(dataset_id):
              
         # Persist a reusable filename-level split for downstream tooling.
         import random
+        random.seed(seed)
         filenames = [f.name for f in pt_files]
         random.shuffle(filenames)
         
@@ -1509,7 +1538,6 @@ def list_models():
                             "batch_size": results.get('config', {}).get('batch_size', 32),
                             "created": datetime.datetime.fromtimestamp(run_dir.stat().st_ctime).strftime('%Y-%m-%d %H:%M:%S'),
                             "status": "Completed",
-                            "path": str(run_dir)
                         }
                         if include_report:
                             model_info["classification_report"] = results.get('classification_report', {})
@@ -1552,7 +1580,6 @@ def get_model_detail(model_id):
             "created": datetime.datetime.fromtimestamp(target_dir.stat().st_ctime).strftime('%Y-%m-%d %H:%M:%S'),
             "status": "Completed",
             "classification_report": results.get('classification_report', {}),
-            "path": str(target_dir)
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1616,11 +1643,15 @@ def train_model_api():
     if not config:
         return jsonify({"error": "Request body must be a JSON with training configuration"}), 400
 
-    processed_data_path = config.get('processed_data_path')
-    if not processed_data_path or not Path(processed_data_path).exists():
-        return jsonify({"error": f"Processed data path is missing or does not exist: {processed_data_path}"}), 400
-    if not has_processed_graphs(Path(processed_data_path)):
-        return jsonify({"error": f"Processed dataset is empty or graph construction has not completed yet: {processed_data_path}"}), 400
+    dataset_id = str(config.get('dataset_id', '')).strip()
+    if not dataset_id or Path(dataset_id).name != dataset_id:
+        return jsonify({"error": "Invalid dataset_id"}), 400
+    processed_data_path = PROCESSED_DATA_DIR / dataset_id
+    if not processed_data_path.exists() or not processed_data_path.is_dir():
+        return jsonify({"error": "Processed dataset does not exist"}), 404
+    if not has_processed_graphs(processed_data_path):
+        return jsonify({"error": "Processed dataset is empty or graph construction has not completed yet"}), 400
+    config['processed_data_path'] = str(processed_data_path)
 
     try:
         batch_size = int(config.get('batch_size', 32))
@@ -1701,7 +1732,7 @@ def run_inference_api():
     save_tasks(force=True)
 
     def inference_worker():
-        return run_inference_pipeline(
+        return _run_inference_pipeline(
             model_dir=model_dir,
             dataset_dir=dataset_dir,
             output_dir=output_dir
@@ -1750,6 +1781,7 @@ def _ensure_result_summary(res_dir: Path) -> dict | None:
         if summary_file.exists() and summary_file.stat().st_mtime >= res_file.stat().st_mtime:
             cached = _read_json_cached(summary_file)
             if isinstance(cached, dict):
+                cached.pop("path", None)
                 return cached
     except OSError:
         pass
@@ -1765,7 +1797,6 @@ def _ensure_result_summary(res_dir: Path) -> dict | None:
         "created": created,
         "total_samples": data.get("total_samples", 0),
         "label_distribution": data.get("label_distribution", {}),
-        "path": str(res_dir),
     }
     try:
         tmp = summary_file.with_suffix('.tmp')
@@ -1838,12 +1869,13 @@ def get_attribution_result_detail(result_id):
     slim = {
         "total_samples": data.get("total_samples", 0),
         "label_distribution": data.get("label_distribution", {}),
-        "output_dir": data.get("output_dir"),
         "results": [
             {
                 "report_id": s.get("report_id"),
                 "predicted_label": s.get("predicted_label"),
+                "model_prediction": s.get("model_prediction", s.get("predicted_label")),
                 "confidence": s.get("confidence"),
+                "decision": s.get("decision", {"status": "legacy", "reasons": []}),
                 "top3": s.get("top3"),
             }
             for s in data.get("results", [])
@@ -1903,6 +1935,71 @@ def get_attribution_sample(result_id, report_id):
         return jsonify({"error": "Sample not found"}), 404
     return jsonify(sample)
 
+
+@app.route('/api/attribution_results/<result_id>/reviews', methods=['GET', 'POST'])
+def attribution_reviews(result_id):
+    target_dir = ATTRIBUTION_RESULTS_DIR / result_id
+    if not target_dir.exists() or not target_dir.is_dir():
+        return jsonify({"error": "Result not found"}), 404
+    if request.method == 'GET':
+        return jsonify(REVIEW_STORE.get_reviews(result_id))
+
+    data = request.get_json(silent=True) or {}
+    sample_id = str(data.get('sample_id', '')).strip()
+    decision = str(data.get('decision', '')).strip()
+    if not sample_id or decision not in VALID_DECISIONS:
+        return jsonify({"error": "sample_id and a valid decision are required"}), 400
+    try:
+        saved = REVIEW_STORE.save_review(
+            result_id=result_id,
+            sample_id=sample_id,
+            decision=decision,
+            corrected_label=str(data.get('corrected_label', '')),
+            note=str(data.get('note', '')),
+            reviewer=str(data.get('reviewer', '')),
+        )
+        return jsonify(saved), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route('/api/attribution_results/<result_id>/export', methods=['GET'])
+def export_attribution_result(result_id):
+    target_dir = ATTRIBUTION_RESULTS_DIR / result_id
+    result_file = target_dir / "inference_results.json"
+    if not result_file.exists():
+        return jsonify({"error": "Result not found"}), 404
+    data = _read_json_file(result_file)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Failed to read result"}), 500
+    export_format = request.args.get('format', 'json').strip().lower()
+    if export_format == 'stix':
+        payload = build_stix_bundle(result_id, data)
+        filename = f"attribution_{result_id}.stix.json"
+    elif export_format == 'json':
+        payload = data
+        filename = f"attribution_{result_id}.json"
+    else:
+        return jsonify({"error": "Supported formats are json and stix"}), 400
+    return Response(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.route('/api/audit_logs', methods=['GET'])
+def list_audit_logs():
+    if not AUDIT_LOG_FILE.exists():
+        return jsonify([])
+    try:
+        limit = min(max(request.args.get('limit', default=100, type=int), 1), 500)
+        lines = AUDIT_LOG_FILE.read_text(encoding='utf-8').splitlines()[-limit:]
+        rows = [json.loads(line) for line in reversed(lines) if line.strip()]
+        return jsonify(rows)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
 @app.route('/api/attribution_results/<result_id>', methods=['DELETE'])
 def delete_attribution_result(result_id):
     """
@@ -1929,10 +2026,16 @@ def generate_report():
         return jsonify({"error": "No data provided"}), 400
     
     # Task ID could be from a training task or an attribution/inference task
-    task_id = data.get('task_id', 'Unknown')
+    task_id = str(data.get('task_id', 'Unknown'))
+    report_options = normalize_report_options(data.get('report_options'))
+    output_format = str(data.get('output_format', 'pdf')).strip().lower()
+    if output_format not in {'pdf', 'json', 'stix'}:
+        return jsonify({"error": "Supported output formats are pdf, json and stix"}), 400
     
     # Try to load real results if not provided in payload
     analysis_results = data.get('analysis_results', {})
+    if not isinstance(analysis_results, dict):
+        return jsonify({"error": "analysis_results must be an object"}), 400
     
     if not analysis_results.get('attributions'):
         # Check if task_id corresponds to an attribution result
@@ -2009,17 +2112,46 @@ def generate_report():
         analysis_results['attributions'] = [{'name': 'Unknown', 'score': 0.0, 'risk': 'Low'}]
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_filename = f"report_{task_id}_{timestamp}.pdf"
+    safe_task_id = "".join(char for char in task_id if char.isalnum() or char in {'-', '_'})[:80] or "unknown"
+    suffix = "pdf" if output_format == "pdf" else "stix.json" if output_format == "stix" else "json"
+    output_filename = f"report_{safe_task_id}_{timestamp}.{suffix}"
     
     try:
-        # Pass output_dir explicitly
-        generator = ReportGenerator(output_dir=REPORTS_DIR)
-        report_path = generator.generate_report(task_id, analysis_results, output_filename)
+        if output_format == 'pdf':
+            from core.report_generator import ReportGenerator
+
+            generator = ReportGenerator(output_dir=REPORTS_DIR)
+            generator.generate_report(
+                task_id,
+                analysis_results,
+                output_filename,
+                report_options=report_options,
+            )
+        else:
+            if output_format == 'stix':
+                export_payload = build_stix_bundle(
+                    task_id,
+                    {
+                        "created": timestamp,
+                        "results": analysis_results.get("result_records", []),
+                    },
+                )
+            else:
+                export_payload = {
+                    "task_id": task_id,
+                    "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "report_options": report_options,
+                    "analysis_results": analysis_results,
+                }
+            (REPORTS_DIR / output_filename).write_text(
+                json.dumps(export_payload, ensure_ascii=False, indent=2),
+                encoding='utf-8',
+            )
         
         return jsonify({
             "message": "Report generated successfully",
             "report_name": output_filename,
-            "report_path": str(report_path),
+            "report_format": output_format,
             "download_path": f"/api/reports/{output_filename}",
             "report_url": f"/api/reports/{output_filename}",
         })

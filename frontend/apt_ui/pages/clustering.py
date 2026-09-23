@@ -98,9 +98,9 @@ def _render_result_panel() -> None:
         return
 
     ui.metric_row([
-        ("Accuracy", f"{result.get('test_accuracy', 0):.2%}"),
-        ("Weighted F1", f"{result.get('test_f1_weighted', 0):.2%}"),
-        ("Temperature", f"{float(result.get('temperature', 1.0)):.3f}"),
+        ("准确率", f"{result.get('test_accuracy', 0):.2%}"),
+        ("加权 F1", f"{result.get('test_f1_weighted', 0):.2%}"),
+        ("温度参数", f"{float(result.get('temperature', 1.0)):.3f}"),
     ])
 
     if st.button("清空结果", key="clear_train_result"):
@@ -146,13 +146,13 @@ def _render_result_panel() -> None:
 
     model_path = result.get("model_path")
     if model_path:
-        st.success(f"模型已保存至: `{model_path}`")
+        st.success("模型文件已保存，可前往“模型管理”页面查看。")
 
 
 def render_clustering() -> None:
     runtime_config = get_runtime_config()
     if not runtime_config.get("training_enabled", True):
-        ui.page_header("模型训练", "Server Resource Limited", icon="fa-project-diagram")
+        ui.page_header("模型训练", "当前服务器未开放在线训练", icon="fa-project-diagram")
         st.warning("当前服务器算力不足，已关闭在线模型训练功能。")
         st.markdown(
             "建议前往 GitHub 本地部署并运行训练流程："
@@ -160,24 +160,10 @@ def render_clustering() -> None:
         )
         return
 
-    ui.page_header("模型训练", "Model Training", icon="fa-project-diagram")
+    ui.page_header("模型训练", "训练参数与运行结果", icon="fa-project-diagram")
 
     datasets = _get_datasets()
     graph_datasets = [item for item in datasets if "Graph" in item.get("type", "")]
-
-    if "latest_preprocessing_run" in st.session_state:
-        latest = st.session_state["latest_preprocessing_run"]
-        latest_path = latest.get("output_path")
-        if latest_path and not any(item.get("path") == latest_path for item in graph_datasets):
-            graph_datasets.insert(
-                0,
-                {
-                    "id": "latest",
-                    "name": "最近一次预处理结果",
-                    "path": latest_path,
-                    "type": "Graph Collection",
-                },
-            )
 
     left, right = st.columns([0.82, 1.18], gap="large")
 
@@ -218,7 +204,7 @@ def render_clustering() -> None:
                 st.divider()
                 epochs = st.number_input("训练轮数", min_value=10, max_value=5000, value=100)
                 lr = st.number_input("学习率", min_value=0.0001, max_value=0.1, value=0.001, format="%.4f")
-                batch_size = st.number_input("Batch Size", min_value=1, max_value=1024, value=32, step=1)
+                batch_size = st.number_input("批次大小", min_value=1, max_value=1024, value=32, step=1)
                 hidden_dim = st.select_slider("隐藏层维度", options=[64, 128, 256, 512], value=128)
                 dropout = st.slider("Dropout", min_value=0.0, max_value=0.9, value=0.5)
                 gradient_accumulation_steps = st.number_input("梯度累积步数", min_value=1, max_value=64, value=1, step=1)
@@ -254,7 +240,6 @@ def _submit_training(selected_dataset, algorithm, epochs, lr, batch_size,
                      hidden_dim, dropout, gradient_accumulation_steps, auto_memory_guard,
                      use_temporal, temporal_hidden) -> None:
     payload = {
-        "processed_data_path": selected_dataset["path"],
         "dataset_id": selected_dataset["id"],
         "dataset_name": selected_dataset["name"],
         "model_type": algorithm,

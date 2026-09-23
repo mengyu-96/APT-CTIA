@@ -75,7 +75,7 @@ def _feature_dataframes(category_counts, entity_type_counts, stats):
 
 
 def render_features():
-    ui.page_header("特征提取与可视化", "Feature Extraction & Visualization", icon="fa-chart-bar")
+    ui.page_header("特征提取与可视化", "查看实体特征和图结构统计", icon="fa-chart-bar")
 
     datasets = get_datasets()
     if not datasets:
@@ -123,6 +123,7 @@ def render_features():
             c_pie, c_bar = st.columns(2)
             with c_pie:
                 fig_pie = px.pie(df_cat, values="Count", names="Category",
+                                 labels={"Count": "数量", "Category": "类别"},
                                  color_discrete_sequence=BRAND_SEQUENCE, hole=0.5)
                 # Keep labels inside the slices so percentages never overflow the
                 # plot area; show the category name + percent on hover.
@@ -140,6 +141,7 @@ def render_features():
                 st.plotly_chart(fig_pie, width="stretch", config=PLOTLY_CHART_CONFIG)
             with c_bar:
                 fig_bar = px.bar(df_top, x="Count", y="Type", orientation="h",
+                                 labels={"Count": "数量", "Type": "实体类型"},
                                  color="Count", color_continuous_scale="Tealgrn")
                 apply_layout(fig_bar, yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig_bar, width="stretch", config=PLOTLY_CHART_CONFIG)
@@ -166,11 +168,17 @@ def render_features():
                 st.markdown("**各组织样本规模分布**")
                 c_box1, c_box2 = st.columns(2)
                 with c_box1:
-                    fig_box_n = px.box(df_graphs, x="apt_group", y="num_nodes", color="apt_group")
+                    fig_box_n = px.box(
+                        df_graphs, x="apt_group", y="num_nodes", color="apt_group",
+                        labels={"apt_group": "APT 组织", "num_nodes": "节点数"},
+                    )
                     apply_layout(fig_box_n, showlegend=False)
                     st.plotly_chart(fig_box_n, width="stretch", config=PLOTLY_CHART_CONFIG)
                 with c_box2:
-                    fig_box_e = px.box(df_graphs, x="apt_group", y="num_edges", color="apt_group")
+                    fig_box_e = px.box(
+                        df_graphs, x="apt_group", y="num_edges", color="apt_group",
+                        labels={"apt_group": "APT 组织", "num_edges": "边数"},
+                    )
                     apply_layout(fig_box_e, showlegend=False)
                     st.plotly_chart(fig_box_e, width="stretch", config=PLOTLY_CHART_CONFIG)
                 st.divider()
@@ -183,11 +191,15 @@ def render_features():
                         color="apt_group" if has_groups else None,
                         hover_data=["report_id"] if "report_id" in df_graphs.columns else None,
                         render_mode="webgl", title="节点数 vs 边数（图复杂度）",
+                        labels={"num_nodes": "节点数", "num_edges": "边数", "apt_group": "APT 组织"},
                     )
                     apply_layout(fig_scatter)
                     st.plotly_chart(fig_scatter, width="stretch", config=PLOTLY_CHART_CONFIG)
                 with c2:
-                    fig_hist = px.histogram(df_graphs, x="num_nodes", nbins=20, title="图规模分布")
+                    fig_hist = px.histogram(
+                        df_graphs, x="num_nodes", nbins=20, title="图规模分布",
+                        labels={"num_nodes": "节点数", "count": "样本数"},
+                    )
                     apply_layout(fig_hist, bargap=0.1)
                     st.plotly_chart(fig_hist, width="stretch", config=PLOTLY_CHART_CONFIG)
             else:

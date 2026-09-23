@@ -4,10 +4,16 @@ import io
 import json
 import logging
 import math
+import os
 import sys
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from backend.core.decision import assess_attribution
+except ImportError:
+    from core.decision import assess_attribution  # type: ignore
 
 import torch
 import torch.nn.functional as F
@@ -760,8 +766,16 @@ def run_inference_pipeline(
         train_results = json.load(fp)
     config = train_results.get("config", {})
 
-    # Probability temperature scaling.
-    temperature = 0.52
+    # Use the calibration value fitted for this exact model run.
+    temperature = _safe_float(train_results.get("temperature"), 1.0)
+    if temperature <= 0:
+        temperature = 1.0
+    min_confidence = _safe_float(os.getenv("ATTRIBUTION_MIN_CONFIDENCE"), 0.6)
+    min_margin = _safe_float(os.getenv("ATTRIBUTION_MIN_MARGIN"), 0.1)
+    try:
+        min_evidence_count = max(0, int(os.getenv("ATTRIBUTION_MIN_EVIDENCE_COUNT", "1")))
+    except ValueError:
+        min_evidence_count = 1
 
     _assert_feature_compatibility(model_dir, dataset_dir, config)
 
@@ -840,10 +854,27 @@ def run_inference_pipeline(
         top3_indices = prob_vec.argsort()[-3:][::-1]
         attention_data = all_attentions[idx] if idx < len(all_attentions) else {}
         explanation = _build_explanation(graph, attention_data, entities_by_report.get(report_id, {}), attack_map)
+        model_prediction = class_names[pred_idx]
+        confidence = float(prob_vec[pred_idx])
+        runner_up = float(prob_vec[top3_indices[1]]) if len(top3_indices) > 1 else 0.0
+        evidence_quality = explanation.get("evidence_quality") or {}
+        evidence_count = len(explanation.get("key_nodes") or []) + len(explanation.get("key_edges") or [])
+        evidence_reliable = bool(evidence_quality.get("reliable", evidence_count > 0))
+        decision = assess_attribution(
+            confidence=confidence,
+            runner_up_confidence=runner_up,
+            evidence_count=evidence_count,
+            evidence_reliable=evidence_reliable,
+            min_confidence=min_confidence,
+            min_margin=min_margin,
+            min_evidence_count=min_evidence_count,
+        )
         inference_results.append({
             "report_id": report_id,
-            "predicted_label": class_names[pred_idx],
-            "confidence": float(prob_vec[pred_idx]),
+            "predicted_label": model_prediction if decision["status"] == "accepted" else "需人工复核",
+            "model_prediction": model_prediction,
+            "confidence": confidence,
+            "decision": decision,
             "top3": [
                 {
                     "label": class_names[j],
@@ -865,6 +896,12 @@ def run_inference_pipeline(
     summary = {
         "total_samples": len(inference_results),
         "label_distribution": label_counts,
+        "calibration_temperature": temperature,
+        "decision_policy": {
+            "min_confidence": min_confidence,
+            "min_margin": min_margin,
+            "min_evidence_count": min_evidence_count,
+        },
         "results": inference_results,
     }
 

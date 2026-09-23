@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -11,6 +10,7 @@ import streamlit as st
 from apt_ui.services import ui
 from apt_ui.services.api_client import get_binary, get_json, invalidate, request
 from apt_ui.services.charting import BRAND_SEQUENCE, PLOTLY_CHART_CONFIG, apply_layout
+from apt_ui.services.presentation import compact_identifier
 from apt_ui.services.task_ui import render_task_panel
 
 
@@ -27,6 +27,12 @@ MODEL_DISPLAY_NAMES = {
     "GCN": "MLDSJ",
     "Transformer": "Mead",
     "GraphSAGE": "TRAIL",
+}
+REVIEW_DECISIONS = {
+    "确认模型结论": "confirmed",
+    "驳回模型结论": "rejected",
+    "改判其他组织": "corrected",
+    "证据不足": "insufficient",
 }
 
 
@@ -57,6 +63,15 @@ def _get_attribution_sample(result_id: str, report_id: str) -> dict | None:
     )
 
 
+def _get_reviews(result_id: str) -> list[dict]:
+    return get_json(
+        f"/api/attribution_results/{result_id}/reviews",
+        timeout=5,
+        default=[],
+        ttl="default",
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _distribution_df(distribution: dict[str, int]) -> pd.DataFrame:
     return pd.DataFrame(list(distribution.items()), columns=["APT组织", "数量"])
@@ -74,7 +89,11 @@ def _result_rows(raw_results: list[dict]) -> pd.DataFrame:
             {
                 "report_id": item.get("report_id"),
                 "predicted_label": item.get("predicted_label"),
-                "confidence": item.get("confidence"),
+                "model_prediction": item.get("model_prediction", item.get("predicted_label")),
+                "confidence": float(item.get("confidence", 0) or 0) * 100,
+                "decision": "需人工复核"
+                if (item.get("decision") or {}).get("status") == "review_required"
+                else "已通过自动判定",
                 "top3": top3,
             }
         )
@@ -92,15 +111,6 @@ def _delete_result(result_id: str) -> bool:
 
 
 def _load_report_bytes(report_info: dict) -> bytes | None:
-    report_path = report_info.get("report_path")
-    if report_path:
-        try:
-            local_path = Path(report_path)
-            if local_path.exists() and local_path.is_file():
-                return local_path.read_bytes()
-        except Exception:
-            pass
-
     download_path = report_info.get("download_path") or report_info.get("report_url")
     if download_path:
         return get_binary(download_path, timeout=30)
@@ -115,16 +125,29 @@ def _render_explanation_panel(sample_result: dict) -> None:
 
     decision_mode = explanation.get("decision_mode") or {}
     c1, c2, c3 = st.columns(3)
-    c1.metric("预测组织", sample_result.get("predicted_label", "Unknown"))
+    c1.metric("模型首选", sample_result.get("model_prediction", sample_result.get("predicted_label", "Unknown")))
     c2.metric("置信度", f"{sample_result.get('confidence', 0):.2%}")
-    c3.metric("主导信号", decision_mode.get("dominant_signal", "unknown"))
+    signal_labels = {
+        "semantic": "语义证据",
+        "structural": "结构证据",
+        "balanced": "语义与结构均衡",
+    }
+    dominant_signal = decision_mode.get("dominant_signal", "unknown")
+    c3.metric("主导信号", signal_labels.get(dominant_signal, "暂无判断"))
+
+    decision = sample_result.get("decision") or {}
+    if decision.get("status") == "review_required":
+        reasons = "；".join(decision.get("reasons") or ["未达到自动归因条件"])
+        st.warning(f"系统已拒绝自动归因并转人工复核：{reasons}")
+    elif decision:
+        st.success("当前结果达到自动归因阈值，仍可由分析师复核。")
 
     if decision_mode:
         st.caption(
             f"语义权重 {decision_mode.get('semantic_gate', 0):.2%} | "
-            f"结构权重 {decision_mode.get('structural_gate', 0):.2%} | "
-            f"{decision_mode.get('description', '')}"
+            f"结构权重 {decision_mode.get('structural_gate', 0):.2%}。"
         )
+    st.caption("置信度是当前模型的输出得分，需结合证据完整性、情报时效和人工研判使用。")
 
     key_nodes = explanation.get("key_nodes") or []
     if key_nodes:
@@ -158,8 +181,68 @@ def _render_explanation_panel(sample_result: dict) -> None:
         st.dataframe(pd.DataFrame(techniques), width="stretch", hide_index=True)
 
 
+def _render_analyst_review(result_id: str, sample_id: str, reviews: list[dict]) -> None:
+    st.markdown("**分析师复核**")
+    sample_reviews = [item for item in reviews if str(item.get("sample_id")) == str(sample_id)]
+    if sample_reviews:
+        latest = sample_reviews[-1]
+        decision_label = next(
+            (label for label, value in REVIEW_DECISIONS.items() if value == latest.get("decision")),
+            latest.get("decision", "未知"),
+        )
+        detail = f"最近结论：{decision_label}"
+        if latest.get("corrected_label"):
+            detail += f" → {latest['corrected_label']}"
+        if latest.get("reviewer"):
+            detail += f"；复核人：{latest['reviewer']}"
+        st.info(detail)
+        if latest.get("note"):
+            st.caption(f"复核说明：{latest['note']}")
+
+    with st.form(f"analyst_review_{result_id}_{sample_id}"):
+        decision_label = st.selectbox("复核结论", list(REVIEW_DECISIONS))
+        corrected_label = st.text_input("改判组织", placeholder="仅在选择“改判其他组织”时必填")
+        note = st.text_area("复核说明", max_chars=2000)
+        reviewer = st.text_input(
+            "复核人",
+            value=str(st.session_state.get("auth_username", "")),
+            max_chars=100,
+        )
+        submitted = st.form_submit_button("保存复核结论", type="primary", width="stretch")
+
+    if not submitted:
+        return
+    decision = REVIEW_DECISIONS[decision_label]
+    if decision == "corrected" and not corrected_label.strip():
+        st.error("改判时必须填写新的 APT 组织名称。")
+        return
+    try:
+        response = request(
+            "POST",
+            f"/api/attribution_results/{result_id}/reviews",
+            json_body={
+                "sample_id": str(sample_id),
+                "decision": decision,
+                "corrected_label": corrected_label.strip(),
+                "note": note.strip(),
+                "reviewer": reviewer.strip(),
+            },
+            timeout=10,
+        )
+    except Exception as exc:
+        st.error(f"保存失败：{exc}")
+        return
+    if response.status_code != 201:
+        st.error(f"保存失败：{response.text}")
+        return
+    invalidate("attribution_results", "audit_logs")
+    st.success("复核结论已保存，并写入审计日志。")
+    st.rerun()
+
+
 def _inference_task_title(task: dict) -> str:
-    return task.get("name") or "归因任务"
+    name = task.get("name") or "归因任务"
+    return "归因任务" if name == "Attribution Inference" else name
 
 
 def _submit_inference(model_id: str, dataset_id: str) -> None:
@@ -322,17 +405,22 @@ def _render_history_view() -> None:
                 '<div class="section-title"><i class="fas fa-bullseye"></i><span>归因结果详情</span></div>',
                 unsafe_allow_html=True,
             )
-            st.caption(f"结果 ID: `{selected_result_id}`")
+            st.caption(f"结果编号：`{compact_identifier(selected_result_id)}`")
         with delete_col:
-            if st.button(f"{ui.ACTION_LABELS['delete']}", key="delete_selected_attr_result", width="stretch"):
+            def delete_selected_result() -> None:
                 if _delete_result(selected_result_id):
                     invalidate("attribution_results")
-                    st.toast("结果已删除", icon="OK")
+                    st.toast("结果已删除", icon="✅")
                     remaining = [item for item in results if item["id"] != selected_result_id]
                     st.session_state["selected_attr_result_id"] = remaining[0]["id"] if remaining else None
-                    st.rerun()
                 else:
                     st.warning("删除失败。")
+
+            ui.confirm_delete(
+                "delete_selected_attr_result",
+                f"归因结果“{compact_identifier(selected_result_id)}”",
+                delete_selected_result,
+            )
 
         distribution = detail.get("label_distribution") or {}
         raw_results = detail.get("results") or []
@@ -400,8 +488,8 @@ def _render_history_view() -> None:
                     "confidence": st.column_config.ProgressColumn(
                         "置信度",
                         min_value=0.0,
-                        max_value=1.0,
-                        format="%.2f",
+                        max_value=100.0,
+                        format="%.2f%%",
                     ),
                     "top3": "Top-3 候选",
                 },
@@ -410,11 +498,11 @@ def _render_history_view() -> None:
             )
 
             st.subheader("解释证据")
-            selector_col, export_col, report_col = st.columns([2.8, 1, 1], gap="small")
+            selector_col, csv_col, json_col, stix_col, report_col = st.columns([2.4, 1, 1, 1, 1], gap="small")
             with selector_col:
                 sample_ids = [item.get("report_id") for item in raw_results]
                 selected_sample_id = st.selectbox("选择样本", sample_ids, key="selected_attr_sample_id")
-            with export_col:
+            with csv_col:
                 csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
                     "导出 CSV",
@@ -422,6 +510,34 @@ def _render_history_view() -> None:
                     f"attribution_results_{selected_result_id}.csv",
                     "text/csv",
                     width="stretch",
+                )
+            with json_col:
+                json_bytes = get_binary(
+                    f"/api/attribution_results/{selected_result_id}/export",
+                    params={"format": "json"},
+                    timeout=20,
+                )
+                st.download_button(
+                    "导出 JSON",
+                    data=json_bytes or b"",
+                    file_name=f"attribution_{selected_result_id}.json",
+                    mime="application/json",
+                    width="stretch",
+                    disabled=not json_bytes,
+                )
+            with stix_col:
+                stix_bytes = get_binary(
+                    f"/api/attribution_results/{selected_result_id}/export",
+                    params={"format": "stix"},
+                    timeout=20,
+                )
+                st.download_button(
+                    "导出 STIX",
+                    data=stix_bytes or b"",
+                    file_name=f"attribution_{selected_result_id}.stix.json",
+                    mime="application/json",
+                    width="stretch",
+                    disabled=not stix_bytes,
                 )
             with report_col:
                 if st.button("PDF 报告", width="stretch", key="generate_attr_pdf"):
@@ -434,12 +550,17 @@ def _render_history_view() -> None:
                         selected_sample = _get_attribution_sample(selected_result_id, selected_sample_id)
                     if selected_sample:
                         _render_explanation_panel(selected_sample)
+                        _render_analyst_review(
+                            selected_result_id,
+                            str(selected_sample_id),
+                            _get_reviews(selected_result_id),
+                        )
                     else:
                         st.info("当前样本没有可展示的解释证据。")
 
 
 def render_attribution() -> None:
-    ui.page_header("APT 归因结果", "APT Attribution Results", icon="fa-bullseye")
+    ui.page_header("APT 归因结果", "创建归因任务并核验证据", icon="fa-bullseye")
 
     if VIEW_STATE_KEY not in st.session_state:
         st.session_state[VIEW_STATE_KEY] = TASK_VIEW_LABEL

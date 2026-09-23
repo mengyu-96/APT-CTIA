@@ -100,18 +100,29 @@ def _render_row(
         for action, col in zip(actions, btn_cols):
             with col:
                 label = f"{action.icon} {action.label}".strip()
-                if st.button(
+                action_key = f"{key_prefix}_{action.label}_{task.get('id')}"
+
+                def execute(current_action=action, current_task=task) -> None:
+                    if current_action.handler(current_task):
+                        invalidate("tasks", "datasets", "models", "attribution_results")
+                        st.toast(f"{current_action.label}成功", icon="✅")
+                    else:
+                        st.warning(f"{current_action.label}失败")
+
+                if action.label == ui.ACTION_LABELS["delete"] and action.enabled(task):
+                    ui.confirm_delete(
+                        action_key,
+                        f"任务“{title_fn(task)}”",
+                        execute,
+                    )
+                elif st.button(
                     label,
-                    key=f"{key_prefix}_{action.label}_{task.get('id')}",
+                    key=action_key,
                     disabled=not action.enabled(task),
                     width="stretch",
                 ):
-                    if action.handler(task):
-                        invalidate("tasks", "datasets", "models", "attribution_results")
-                        st.toast(f"{action.label}成功", icon="✅")
-                        st.rerun()
-                    else:
-                        st.warning(f"{action.label}失败")
+                    execute()
+                    st.rerun()
 
     st.divider()
 
@@ -131,12 +142,15 @@ def _render_list(
         return
 
     ordered = _sort_tasks(tasks)
-    if any(t.get("status") in ACTIVE_STATUSES for t in ordered):
+    active_tasks = [task for task in ordered if task.get("status") in ACTIVE_STATUSES]
+    history_tasks = [task for task in ordered if task.get("status") not in ACTIVE_STATUSES]
+
+    if active_tasks:
         st.caption("运行中的任务固定显示在顶部，列表会自动刷新。")
     else:
-        st.caption("空闲时不自动刷新；提交、删除或手动刷新后更新。")
+        st.caption("当前没有运行中的任务。")
 
-    for task in ordered:
+    for task in active_tasks:
         _render_row(
             task,
             key_prefix=key_prefix,
@@ -145,6 +159,19 @@ def _render_list(
             actions=actions,
             active_message=active_message,
         )
+
+    if history_tasks:
+        with st.expander(f"历史任务（{len(history_tasks)}）", expanded=False):
+            st.caption("已完成和失败的任务默认折叠，可在这里查看或删除。")
+            for task in history_tasks:
+                _render_row(
+                    task,
+                    key_prefix=key_prefix,
+                    title_fn=title_fn,
+                    subtitle_fn=subtitle_fn,
+                    actions=actions,
+                    active_message=active_message,
+                )
 
 
 def render_task_panel(

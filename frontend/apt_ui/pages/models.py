@@ -7,6 +7,7 @@ import streamlit as st
 from apt_ui.services.api_client import invalidate, get_json, request
 from apt_ui.services.charting import PLOTLY_CHART_CONFIG, apply_layout
 from apt_ui.services import ui
+from apt_ui.services.presentation import format_percentage
 
 
 MODEL_DISPLAY_NAMES = {
@@ -99,7 +100,7 @@ def _class_report_df(report: dict) -> pd.DataFrame:
 
 
 def render_models() -> None:
-    ui.page_header("模型管理", "Model Management", icon="fa-microchip")
+    ui.page_header("模型管理", "查看、比较和维护已训练模型", icon="fa-microchip")
 
     if ui.refresh_button("refresh_models", label="刷新模型列表"):
         invalidate("models")
@@ -110,29 +111,33 @@ def render_models() -> None:
         st.info("暂无已训练模型，请先在「模型训练」页面提交训练任务。")
         return
 
-    display_models = [_display_model(model) for model in models]
+    display_models = sorted(
+        (_display_model(model) for model in models),
+        key=lambda item: str(item.get("created", "")),
+        reverse=True,
+    )
     latest_model = display_models[0]
     ui.metric_row([
         ("模型数量", len(models)),
-        ("最新模型 Accuracy", f"{latest_model.get('accuracy', 0):.3f}"),
-        ("最新模型 F1", f"{latest_model.get('f1_score', 0):.3f}"),
+        ("最新模型准确率", format_percentage(latest_model.get("accuracy", 0))),
+        ("最新模型 F1", format_percentage(latest_model.get("f1_score", 0))),
     ])
 
     chart_col, info_col = st.columns([2, 1], gap="large")
     with chart_col:
-        with ui.section_card("APT-CTI 数据集模型性能对比", icon="fa-chart-column"):
+        with ui.section_card("模型性能对比", icon="fa-chart-column"):
             df_perf = _performance_df(display_models)
             metric_columns = ["准确率", "加权精确率", "加权召回率", "加权F1"]
             fig = px.bar(df_perf, x="模型", y=metric_columns, barmode="group")
-            fig.update_yaxes(range=[0, 1], tickformat=".2f")
-            apply_layout(fig, xaxis_title="模型", yaxis_title="性能得分")
+            fig.update_yaxes(range=[0, 1], tickformat=".0%")
+            apply_layout(fig, xaxis_title="模型", yaxis_title="性能得分（百分比）")
             st.plotly_chart(fig, width="stretch", config=PLOTLY_CHART_CONFIG)
 
     with info_col:
         with ui.section_card("最新模型", icon="fa-star"):
             st.metric("名称", latest_model["display_name"])
             st.metric("数据集", latest_model.get("dataset_name", "Unknown"))
-            st.caption(f"Batch Size: {latest_model.get('batch_size', 32)} · 创建时间: {latest_model.get('created', '-')}")
+            st.caption(f"批次大小：{latest_model.get('batch_size', 32)} · 创建时间：{latest_model.get('created', '-')}")
 
     search_col, _ = st.columns([2, 3])
     with search_col:
@@ -165,18 +170,24 @@ def render_models() -> None:
                 left, right = st.columns([1.3, 1], gap="large")
                 with left:
                     if not report_df.empty:
-                        fig_cls = px.bar(report_df, x="Class",
-                                         y=["Precision", "Recall", "F1-Score"], barmode="group")
+                        fig_cls = px.bar(
+                            report_df,
+                            x="Class",
+                            y=["Precision", "Recall", "F1-Score"],
+                            barmode="group",
+                            labels={"Class": "组织", "value": "得分", "variable": "指标"},
+                        )
+                        fig_cls.update_yaxes(range=[0, 1], tickformat=".0%")
                         apply_layout(fig_cls)
                         st.plotly_chart(fig_cls, width="stretch", config=PLOTLY_CHART_CONFIG)
                     else:
                         st.info("当前模型没有详细分类报告。")
                 with right:
-                    st.caption(f"Epochs: {detail.get('epochs', 0)} · Batch Size: {detail.get('batch_size', 32)}")
+                    st.caption(f"训练轮数：{detail.get('epochs', 0)} · 批次大小：{detail.get('batch_size', 32)}")
                     macro = report.get("macro avg", {})
                     weighted = report.get("weighted avg", {})
                     radar_df = pd.DataFrame({
-                        "metric": ["Accuracy", "Macro Precision", "Macro Recall", "Macro F1", "Weighted F1"],
+                        "metric": ["准确率", "宏平均精确率", "宏平均召回率", "宏平均 F1", "加权 F1"],
                         "value": [
                             report.get("accuracy", 0.0),
                             macro.get("precision", 0.0),
@@ -206,13 +217,13 @@ def render_models() -> None:
                 st.markdown(f"**{model['display_name']}**")
                 st.caption(
                     f"类型: {model.get('display_type', 'Unknown')} · 数据集: {model.get('dataset_name', 'Unknown')} · "
-                    f"轮数: {model.get('epochs', 0)} · Batch Size: {model.get('batch_size', 32)} · 创建: {model.get('created', '-')}"
+                    f"轮数：{model.get('epochs', 0)} · 批次大小：{model.get('batch_size', 32)} · 创建：{model.get('created', '-')}"
                 )
 
             with stat_col:
                 c1, c2 = st.columns(2)
-                c1.metric("Accuracy", f"{model.get('accuracy', 0):.3f}")
-                c2.metric("F1", f"{model.get('f1_score', 0):.3f}")
+                c1.metric("准确率", format_percentage(model.get("accuracy", 0)))
+                c2.metric("F1", format_percentage(model.get("f1_score", 0)))
 
             with action_col:
                 if st.button(f"👁️ {ui.ACTION_LABELS['view']}", key=f"view_model_{idx}", width="stretch"):
@@ -235,12 +246,18 @@ def render_models() -> None:
                             st.rerun()
                         st.error(message)
                 with delete_col:
-                    if st.button(f"🗑️ {ui.ACTION_LABELS['delete']}", key=f"delete_model_{idx}", width="stretch"):
-                        ok, message = _delete_model(model["id"])
+                    def delete_current_model(current_model=model) -> None:
+                        ok, message = _delete_model(current_model["id"])
                         if ok:
                             invalidate("models")
-                            if st.session_state.get("selected_model_id") == model["id"]:
+                            if st.session_state.get("selected_model_id") == current_model["id"]:
                                 st.session_state["selected_model_id"] = None
                             st.toast(message, icon="✅")
-                            st.rerun()
-                        st.error(message)
+                        else:
+                            st.error(message)
+
+                    ui.confirm_delete(
+                        f"delete_model_{idx}",
+                        f"模型“{model['display_name']}”",
+                        delete_current_model,
+                    )

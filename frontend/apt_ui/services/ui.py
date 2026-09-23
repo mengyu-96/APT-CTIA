@@ -8,9 +8,10 @@ instead of copy-pasted inline HTML.
 from __future__ import annotations
 
 import contextlib
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # Human-readable, full-word action labels (replaces single-char "删/看").
@@ -22,6 +23,48 @@ ACTION_LABELS = {
     "open": "打开",
     "export": "导出",
 }
+
+
+def apply_accessibility_metadata() -> None:
+    """Set document language and login autocomplete metadata in the host page."""
+    components.html(
+        """
+        <script>
+        const doc = window.parent.document;
+        doc.documentElement.lang = "zh-CN";
+        const apply = () => {
+          const username = doc.querySelector('input[aria-label="用户名"]');
+          const password = doc.querySelector('input[aria-label="密码"]');
+          const main = doc.querySelector('[data-testid="stAppViewContainer"]');
+          const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+          if (username) username.setAttribute("autocomplete", "username");
+          if (password) password.setAttribute("autocomplete", "current-password");
+          if (main) main.setAttribute("role", "main");
+          if (sidebar) {
+            sidebar.setAttribute("role", "navigation");
+            sidebar.setAttribute("aria-label", "主导航");
+          }
+        };
+        apply();
+        new MutationObserver(apply).observe(doc.body, {childList: true, subtree: true});
+
+        const page = new URL(window.parent.location.href).searchParams.get("page") || "home";
+        const previousPage = window.parent.sessionStorage.getItem("grace-page");
+        window.parent.sessionStorage.setItem("grace-page", page);
+        if (window.parent.innerWidth <= 768 && previousPage && previousPage !== page) {
+          window.parent.setTimeout(() => {
+            const collapse = doc.querySelector('[data-testid="stSidebarCollapseButton"] button')
+              || doc.querySelector('[data-testid="stSidebarCollapseButton"]');
+            const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+            const bounds = sidebar ? sidebar.getBoundingClientRect() : null;
+            if (collapse && bounds && bounds.x >= -1 && bounds.width > 0) collapse.click();
+          }, 350);
+        }
+        </script>
+        """,
+        height=0,
+        scrolling=False,
+    )
 
 _STATUS_META = {
     "pending": ("排队中", "pill-pending"),
@@ -91,6 +134,35 @@ def refresh_button(key: str, *, label: str | None = None, on_click=None) -> bool
         on_click=on_click,
         help="重新从后端拉取最新数据",
     )
+
+
+def confirm_delete(key: str, target: str, on_confirm: Callable[[], object]) -> None:
+    """Render a two-step destructive action and execute only after confirmation."""
+    state_key = f"confirm_{key}"
+    if not st.session_state.get(state_key):
+        if st.button(
+            f"🗑️ {ACTION_LABELS['delete']}",
+            key=key,
+            width="stretch",
+            help=f"删除{target}",
+        ):
+            st.session_state[state_key] = True
+            st.rerun()
+        return
+
+    st.warning(f"确认永久删除{target}？此操作无法撤销。")
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("永久删除", key=f"{key}_confirm", type="primary", width="stretch"):
+            try:
+                on_confirm()
+            finally:
+                st.session_state.pop(state_key, None)
+            st.rerun()
+    with cancel_col:
+        if st.button("取消", key=f"{key}_cancel", width="stretch"):
+            st.session_state.pop(state_key, None)
+            st.rerun()
 
 
 def metric_row(items: Iterable[tuple[str, object]]) -> None:

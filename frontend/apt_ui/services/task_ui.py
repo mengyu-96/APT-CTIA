@@ -226,7 +226,7 @@ def render_task_panel(
         _poll()
     else:
         _render_list(
-            _fetch("default"),
+            initial,
             key_prefix=f"{key_prefix}_static",
             title_fn=title_fn,
             subtitle_fn=subtitle_fn,

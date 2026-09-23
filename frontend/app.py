@@ -382,23 +382,10 @@ def main() -> None:
                 _clear_session()
 
     selected_key = PAGE_BY_MENU_LABEL.get(selected, "home")
-    page_slot = st.empty()
     if selected_key != requested_page:
         st.session_state["_main_navigation_page"] = selected_key
         st.query_params["page"] = selected_key
-        page_slot.empty()
-        st.session_state["_rendered_page"] = selected_key
-        st.rerun()
-    previous_page = st.session_state.get("_rendered_page")
-    if previous_page is not None and previous_page != selected_key:
-        # Clear the old page in a separate run. A same-run replacement can
-        # retain trailing elements from a longer page beneath the new page.
-        page_slot.empty()
-        st.session_state["_rendered_page"] = selected_key
-        st.rerun()
-    st.session_state["_rendered_page"] = selected_key
-    with page_slot.container():
-        _render_page(selected_key)
+    _render_page(selected_key)
 
 
 def _render_page(selected_key: str) -> None:

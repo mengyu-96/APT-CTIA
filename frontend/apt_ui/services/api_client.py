@@ -135,6 +135,26 @@ def get_json(
         return default
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def get_backend_status() -> tuple[bool, str]:
+    """Return whether the API is reachable without confusing failure with no data."""
+
+    try:
+        response = _request(
+            "GET",
+            "/api/runtime_config",
+            timeout=(0.5, 1.5),
+        )
+    except requests.RequestException:
+        return False, "后端服务未连接"
+    except Exception:
+        return False, "后端服务状态检查失败"
+
+    if response.status_code == 200:
+        return True, "正常"
+    return False, f"后端服务异常（HTTP {response.status_code}）"
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def get_runtime_config() -> dict[str, Any]:
     default_config = {
@@ -161,11 +181,8 @@ def get_dashboard_counts() -> dict[str, int]:
 @st.cache_data(ttl=15, show_spinner=False)
 def get_system_health() -> str:
     """Return a user-facing backend health label without masking failures."""
-    try:
-        response = _request("GET", "/api/runtime_config", timeout=1.5)
-        return "正常" if response.status_code == 200 else "异常"
-    except Exception:
-        return "离线"
+    available, message = get_backend_status()
+    return "正常" if available else message.replace("后端服务", "")
 
 
 def get_artifact_bytes(path: str, *, timeout: float = 5) -> bytes | None:
@@ -252,5 +269,6 @@ def clear_api_cache() -> None:
     _get_json_slow.clear()
     _read_local_bytes.clear()
     _get_bytes.clear()
+    get_backend_status.clear()
     get_dashboard_counts.clear()
     get_system_health.clear()

@@ -14,7 +14,11 @@ from apt_ui.pages.features import render_features
 from apt_ui.pages.models import render_models
 from apt_ui.pages.report import render_report
 from apt_ui.pages.upload import render_upload
-from apt_ui.services.api_client import get_dashboard_counts, get_system_health
+from apt_ui.services.api_client import (
+    get_backend_status,
+    get_dashboard_counts,
+    get_system_health,
+)
 from apt_ui.services import ui
 from apt_ui.services.security import UserStore, load_auth_config, verify_credentials
 from apt_ui.services.streamlit_compat import install_streamlit_width_compatibility
@@ -385,6 +389,16 @@ def main() -> None:
     if selected_key != requested_page:
         st.session_state["_main_navigation_page"] = selected_key
         st.query_params["page"] = selected_key
+
+    backend_available, backend_message = get_backend_status()
+    if not backend_available:
+        page_label = MENU_LABEL_BY_PAGE.get(selected_key, "当前页面")
+        st.error(f"{backend_message}，暂时无法加载“{page_label}”的数据。")
+        st.info(
+            "当前地址只启动了前端界面。请同时启动后端服务后再刷新页面；"
+            "Linux 部署环境请检查 backend 服务或容器是否正在运行。"
+        )
+        return
     _render_page(selected_key)
 
 

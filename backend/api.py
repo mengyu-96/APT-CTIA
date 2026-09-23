@@ -1988,18 +1988,6 @@ def export_attribution_result(result_id):
     )
 
 
-@app.route('/api/audit_logs', methods=['GET'])
-def list_audit_logs():
-    if not AUDIT_LOG_FILE.exists():
-        return jsonify([])
-    try:
-        limit = min(max(request.args.get('limit', default=100, type=int), 1), 500)
-        lines = AUDIT_LOG_FILE.read_text(encoding='utf-8').splitlines()[-limit:]
-        rows = [json.loads(line) for line in reversed(lines) if line.strip()]
-        return jsonify(rows)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
 @app.route('/api/attribution_results/<result_id>', methods=['DELETE'])
 def delete_attribution_result(result_id):
     """
@@ -2167,26 +2155,6 @@ def download_report(filename):
     """
     from flask import send_from_directory
     return send_from_directory(REPORTS_DIR, filename, as_attachment=True, download_name=filename)
-
-@app.route('/api/gangs', methods=['GET'])
-def get_gangs():
-    """
-    Get the list of known APT gangs.
-    """
-    try:
-        import json
-        gangs_file = BASE_DIR / 'backend' / 'data' / 'gangs.json'
-        if not gangs_file.exists():
-             # Fallback if file not found (or path issue)
-             gangs_file = Path(__file__).resolve().parent / 'data' / 'gangs.json'
-        
-        if gangs_file.exists():
-            with open(gangs_file, 'r', encoding='utf-8') as f:
-                return jsonify(json.load(f))
-        else:
-             return jsonify([])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     # 启动 Flask 服务，监听所有网络接口的 5001 端口

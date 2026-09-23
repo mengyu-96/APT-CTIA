@@ -235,8 +235,8 @@ def _render_analyst_review(result_id: str, sample_id: str, reviews: list[dict]) 
     if response.status_code != 201:
         st.error(f"保存失败：{response.text}")
         return
-    invalidate("attribution_results", "audit_logs")
-    st.success("复核结论已保存，并写入审计日志。")
+    invalidate("attribution_results")
+    st.success("复核结论已保存。")
     st.rerun()
 
 

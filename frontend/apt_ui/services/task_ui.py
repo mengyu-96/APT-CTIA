@@ -59,11 +59,7 @@ def default_delete_action() -> TaskAction:
 
 
 def _sort_tasks(tasks: list[dict]) -> list[dict]:
-    def key(task: dict) -> tuple[int, str]:
-        rank = 0 if task.get("status") in ACTIVE_STATUSES else 1
-        return rank, str(task.get("created", ""))
-
-    return sorted(tasks, key=key)
+    return sorted(tasks, key=lambda task: str(task.get("created", "")), reverse=True)
 
 
 def _render_row(

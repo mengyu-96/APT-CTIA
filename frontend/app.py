@@ -8,13 +8,11 @@ import streamlit as st
 from streamlit_option_menu import option_menu
 
 from apt_ui.pages.attribution import render_attribution
-from apt_ui.pages.audit import render_audit_log
 from apt_ui.pages.clustering import render_clustering
 from apt_ui.pages.datasets import render_datasets
 from apt_ui.pages.features import render_features
 from apt_ui.pages.models import render_models
 from apt_ui.pages.report import render_report
-from apt_ui.pages.threat_actors import render_threat_actors
 from apt_ui.pages.upload import render_upload
 from apt_ui.services.api_client import get_dashboard_counts, get_system_health
 from apt_ui.services import ui
@@ -39,9 +37,7 @@ MENU_ENTRIES = [
     ("training", "模型训练", "diagram-3"),
     ("models", "模型管理", "cpu"),
     ("attribution", "APT归因结果", "bullseye"),
-    ("actors", "APT组织情报库", "person-badge"),
     ("report", "报告生成与导出", "file-text"),
-    ("audit", "审计日志", "clipboard-check"),
 ]
 PAGE_BY_MENU_LABEL = {label: page for page, label, _ in MENU_ENTRIES}
 MENU_LABEL_BY_PAGE = {page: label for page, label, _ in MENU_ENTRIES}
@@ -203,8 +199,6 @@ def render_software_guide() -> None:
         **其他功能**
 
         - “模型管理”用于查看、比较和维护训练模型。
-        - “APT组织情报库”用于查询组织别名、常用工具和 TTP。
-        - “审计日志”记录分析师的复核与关键操作。
         - 退出账号请展开左侧底部的“会话管理”，然后点击“退出登录”。
         """
     )
@@ -221,12 +215,10 @@ FEATURE_MODULES = [
     ("fa-chart-bar", "特征提取", "多维特征可视化", "purple"),
     ("fa-project-diagram", "模型训练", "多层异构图与双流学习", "indigo"),
     ("fa-bullseye", "APT 归因", "攻击组织溯源", "warning"),
-    ("fa-user-secret", "组织情报库", "组织画像、工具与 TTP", "cyan"),
     ("fa-stream", "归因记录", "历史结果与解释证据", "warning"),
     ("fa-database", "数据集", "样本数据管理", "cyan"),
     ("fa-file-alt", "报告生成", "分析报告导出", "success"),
     ("fa-brain", "模型管理", "算法模型管理", "purple"),
-    ("fa-clipboard-list", "审计日志", "分析师复核留痕", "blue"),
 ]
 
 
@@ -283,9 +275,9 @@ def render_home() -> None:
     )
 
     st.markdown('<div class="section-title"><i class="fas fa-th-large"></i><span>核心功能</span></div>', unsafe_allow_html=True)
-    for row_start in range(0, len(FEATURE_MODULES), 5):
-        cols = st.columns(5)
-        for col, (icon, title, desc, tone) in zip(cols, FEATURE_MODULES[row_start:row_start + 5]):
+    for row_start in range(0, len(FEATURE_MODULES), 4):
+        cols = st.columns(4)
+        for col, (icon, title, desc, tone) in zip(cols, FEATURE_MODULES[row_start:row_start + 4]):
             col.markdown(_feature_card(icon, title, desc, tone), unsafe_allow_html=True)
 
     st.markdown("<div style='height: 1.6rem;'></div>", unsafe_allow_html=True)
@@ -426,10 +418,6 @@ def _render_page(selected_key: str) -> None:
         render_report()
     elif selected_key == "models":
         render_models()
-    elif selected_key == "actors":
-        render_threat_actors()
-    elif selected_key == "audit":
-        render_audit_log()
 
 
 if __name__ == "__main__":

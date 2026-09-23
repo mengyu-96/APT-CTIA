@@ -92,7 +92,10 @@ def render_features():
     with ui.section_card():
         c1, c2 = st.columns([4, 1], gap="medium")
         with c1:
-            selected_name = st.selectbox("选择数据集", list(dataset_options))
+            selected_name = st.selectbox(
+                "选择已处理数据（数据集或预处理结果）",
+                list(dataset_options),
+            )
         with c2:
             st.write("")
             if ui.refresh_button("refresh_features"):

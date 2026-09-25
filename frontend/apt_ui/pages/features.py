@@ -119,9 +119,16 @@ def render_features():
     ])
 
     st.write("")
-    tab_all, tab_detail, tab_insight = st.tabs(["总体分布", "详细统计", "深度洞察"])
+    current_view = st.segmented_control(
+        "统计视图",
+        ["总体分布", "详细统计", "深度洞察"],
+        selection_mode="single",
+        key="feature_stats_view",
+    )
+    if current_view is None:
+        current_view = "总体分布"
 
-    with tab_all:
+    if current_view == "总体分布":
         with ui.section_card("特征类别分布", icon="fa-chart-pie"):
             c_pie, c_bar = st.columns(2)
             with c_pie:
@@ -146,10 +153,27 @@ def render_features():
                 fig_bar = px.bar(df_top, x="Count", y="Type", orientation="h",
                                  labels={"Count": "数量", "Type": "实体类型"},
                                  color="Count", color_continuous_scale="Tealgrn")
-                apply_layout(fig_bar, yaxis=dict(autorange="reversed"))
+                apply_layout(
+                    fig_bar,
+                    yaxis=dict(autorange="reversed", automargin=True),
+                    margin=dict(l=185, r=20, t=10, b=55),
+                )
+                fig_bar.update_yaxes(title_text=None)
+                fig_bar.add_annotation(
+                    text="实<br>体<br>类<br>型",
+                    textangle=0,
+                    x=-0.31,
+                    y=0.5,
+                    xref="paper",
+                    yref="paper",
+                    xanchor="center",
+                    yanchor="middle",
+                    showarrow=False,
+                    font=dict(color="#E6EDF7", size=15),
+                )
                 st.plotly_chart(fig_bar, width="stretch", config=PLOTLY_CHART_CONFIG)
 
-    with tab_detail:
+    elif current_view == "详细统计":
         with ui.section_card("各类特征详细统计", icon="fa-table"):
             max_count = int(df_detail["Count"].max()) if not df_detail.empty else 100
             st.dataframe(
@@ -164,7 +188,7 @@ def render_features():
                 height=420,
             )
 
-    with tab_insight:
+    else:
         with ui.section_card("图结构洞察", icon="fa-diagram-project"):
             has_groups = "apt_group" in df_graphs.columns and df_graphs["apt_group"].notna().any()
             if has_groups:

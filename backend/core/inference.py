@@ -250,10 +250,65 @@ def _load_feature_manifest(path: Path) -> Optional[Dict[str, Any]]:
     return manifest
 
 
+def _manifest_feature_dim(manifest: Optional[Dict[str, Any]]) -> Optional[int]:
+    if manifest is None:
+        return None
+    features = manifest.get("features")
+    if not isinstance(features, dict):
+        return None
+    try:
+        value = int(features.get("actual_dim"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _infer_checkpoint_input_dim(model_path: Path, config: Dict[str, Any]) -> Optional[int]:
+    """Read the node-feature width expected by a saved model checkpoint."""
+    if not model_path.exists():
+        return None
+    try:
+        raw_blob = torch.load(model_path, map_location="cpu")
+        state_dict = _extract_state_dict(raw_blob)
+    except Exception as exc:
+        LOGGER.warning("Could not inspect model input dimension from %s: %s", model_path, exc)
+        return None
+    if not isinstance(state_dict, dict):
+        return None
+
+    normalized = {
+        key.removeprefix("module."): value
+        for key, value in state_dict.items()
+        if isinstance(key, str) and isinstance(value, torch.Tensor)
+    }
+    model_type = str(config.get("model_type", "GAT")).upper()
+    candidate_suffixes = {
+        "RGAT": ("input_norm.weight", "gat_conv.lin.weight", "gat_conv.lin_l.weight"),
+        "GCN": ("convs.0.lin.weight",),
+        "GAT": ("convs.0.lin.weight", "convs.0.lin_src.weight"),
+        "TRANSFORMER": ("convs.0.lin_key.weight",),
+        "GRAPHSAGE": ("convs.0.lin_l.weight",),
+        "GIN": ("convs.0.nn.0.weight",),
+    }.get(model_type, ("convs.0.lin.weight", "convs.0.lin_key.weight"))
+
+    for suffix in candidate_suffixes:
+        for key, value in normalized.items():
+            if not key.endswith(suffix):
+                continue
+            if suffix == "input_norm.weight" and value.ndim == 1:
+                return int(value.numel())
+            if value.ndim >= 2:
+                return int(value.shape[-1])
+    return None
+
+
 def _assert_feature_compatibility(
     model_dir: Path,
     dataset_dir: Path,
     train_config: Dict[str, Any],
+    *,
+    model_input_dim: Optional[int] = None,
+    dataset_input_dim: Optional[int] = None,
 ) -> None:
     model_manifest = _load_feature_manifest(model_dir)
     if model_manifest is None:
@@ -262,14 +317,37 @@ def _assert_feature_compatibility(
             model_manifest = _load_feature_manifest(Path(training_data_path))
     dataset_manifest = _load_feature_manifest(dataset_dir)
 
-    if model_manifest is None and dataset_manifest is None:
-        LOGGER.warning("Feature manifests are missing; treating model and dataset as legacy artifacts.")
-        return
+    resolved_model_dim = _manifest_feature_dim(model_manifest) or model_input_dim
+    resolved_dataset_dim = _manifest_feature_dim(dataset_manifest) or dataset_input_dim
+
     if model_manifest is None or dataset_manifest is None:
-        raise RuntimeError(
-            "Feature contract mismatch: one artifact is legacy and the other is versioned. "
-            "Reprocess the training data and retrain the model before inference."
-        )
+        if (model_manifest is None) != (dataset_manifest is None) and (
+            resolved_model_dim is None or resolved_dataset_dim is None
+        ):
+            raise RuntimeError(
+                "Feature compatibility could not be verified because one artifact is legacy "
+                "and its input dimension is unavailable. Reprocess the training data and "
+                "retrain the model before inference."
+            )
+        if (
+            resolved_model_dim is not None
+            and resolved_dataset_dim is not None
+            and resolved_model_dim != resolved_dataset_dim
+        ):
+            raise RuntimeError(
+                "Feature dimension mismatch between model and inference dataset: "
+                f"model={resolved_model_dim}, dataset={resolved_dataset_dim}. "
+                "Reprocess the training data and retrain the model before inference."
+            )
+        if model_manifest is None and dataset_manifest is None:
+            LOGGER.warning("Feature manifests are missing; treating model and dataset as legacy artifacts.")
+        else:
+            LOGGER.warning(
+                "One feature manifest is missing; allowing legacy compatibility because the "
+                "model and dataset input dimensions agree (%s).",
+                resolved_dataset_dim or resolved_model_dim,
+            )
+        return
     if model_manifest["fingerprint"] != dataset_manifest["fingerprint"]:
         raise RuntimeError(
             "Feature contract mismatch between model and inference dataset: "
@@ -777,8 +855,6 @@ def run_inference_pipeline(
     except ValueError:
         min_evidence_count = 1
 
-    _assert_feature_compatibility(model_dir, dataset_dir, config)
-
     class_names = []
     if "classification_report" in train_results:
         keys = list(train_results["classification_report"].keys())
@@ -796,6 +872,15 @@ def run_inference_pipeline(
 
     input_dim = graphs[0].x.size(1)
     text_emb_dim = graphs[0].doc_emb.size(1) if hasattr(graphs[0], "doc_emb") and graphs[0].doc_emb is not None else 0
+    model_path = model_dir / "best_model.pt"
+    model_input_dim = _infer_checkpoint_input_dim(model_path, config)
+    _assert_feature_compatibility(
+        model_dir,
+        dataset_dir,
+        config,
+        model_input_dim=model_input_dim,
+        dataset_input_dim=int(input_dim),
+    )
 
     train_data_path = config.get("processed_data_path")
     if not class_names and train_data_path:
@@ -811,7 +896,6 @@ def run_inference_pipeline(
     if num_classes == 0:
         raise RuntimeError("Could not determine number of classes from model config or results.")
 
-    model_path = model_dir / "best_model.pt"
     model, device = load_model_for_inference(model_path, config, num_classes, input_dim, text_emb_dim)
 
     entities_by_report = _load_entities_by_report(dataset_dir)

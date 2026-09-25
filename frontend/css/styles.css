@@ -59,23 +59,23 @@ body { color: var(--text-primary); }
 [data-testid="stHeader"] { background: transparent !important; }
 [data-testid="stToolbar"] { background: transparent !important; }
 
-/* The local software guide occupies Streamlit's former Deploy position. */
-div[data-testid="element-container"]:has(.software-guide-anchor),
-div[data-testid="stElementContainer"]:has(.software-guide-anchor) { display: none; }
-div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"],
-div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] {
+/* Keep the software guide in the upper-left corner of the navigation rail. */
+[data-testid="stSidebar"] div[data-testid="element-container"]:has(.software-guide-anchor),
+[data-testid="stSidebar"] div[data-testid="stElementContainer"]:has(.software-guide-anchor) { display: none; }
+[data-testid="stSidebar"] div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"],
+[data-testid="stSidebar"] div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] {
     position: fixed !important;
-    top: 1.125rem;
-    right: 4rem;
+    top: 1.3125rem;
+    left: .75rem;
     z-index: 999999;
     width: fit-content !important;
 }
-div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"] [data-testid="stButton"],
-div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] [data-testid="stButton"] {
+[data-testid="stSidebar"] div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"] [data-testid="stButton"],
+[data-testid="stSidebar"] div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] [data-testid="stButton"] {
     width: auto !important;
 }
-div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"] button,
-div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] button {
+[data-testid="stSidebar"] div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"] button,
+[data-testid="stSidebar"] div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] button {
     min-height: 2.25rem;
     padding: .35rem .75rem;
     color: var(--text-secondary) !important;
@@ -83,8 +83,8 @@ div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-tes
     border: 0 !important;
     border-radius: 6px !important;
 }
-div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"] button:hover,
-div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] button:hover {
+[data-testid="stSidebar"] div[data-testid="element-container"]:has(.software-guide-anchor) + div[data-testid="element-container"] button:hover,
+[data-testid="stSidebar"] div[data-testid="stElementContainer"]:has(.software-guide-anchor) + div[data-testid="stElementContainer"] button:hover {
     color: var(--primary) !important;
     background: var(--primary-soft) !important;
 }
@@ -439,7 +439,6 @@ button[data-testid="baseButton-primaryFormSubmit"]:hover {
     text-align: left;
 }
 .feature-module p { width: calc(100% - 1.5rem); margin: 0; color: var(--text-muted); font-size: .86rem; text-align: left; }
-.feature-module-arrow { position: absolute; right: 1rem; bottom: .85rem; color: color-mix(in srgb, var(--module-color, var(--primary)) 56%, var(--text-muted)); font-size: 1rem; }
 .feature-module--blue { --module-color: var(--primary); }
 .feature-module--cyan { --module-color: var(--cyan); }
 .feature-module--purple { --module-color: var(--purple); }

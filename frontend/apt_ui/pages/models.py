@@ -11,7 +11,7 @@ from apt_ui.services.presentation import format_percentage
 
 
 MODEL_DISPLAY_NAMES = {
-    "RGAT": "GRACE",
+    "RGAT": "HERA",
     "GAT": "APT-ATT",
     "Hybrid": "APT-MMF",
     "GCN": "MLDSJ",

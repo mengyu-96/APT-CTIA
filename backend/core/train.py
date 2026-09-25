@@ -1529,6 +1529,27 @@ def _filter_graphs_by_min_class_samples(graphs: List[Data], min_class_samples: i
     }
 
 
+def validate_training_graphs(graphs: List[Data]) -> None:
+    """Reject datasets that cannot produce a valid classification split."""
+    graph_count = len(graphs)
+    if graph_count < 3:
+        raise ValueError(
+            f"训练至少需要 3 个报告样本，才能划分训练集、验证集和测试集；当前只有 {graph_count} 个。"
+            "请先预处理包含多个报告的数据集。"
+        )
+
+    labels = {
+        int(graph.y.item())
+        for graph in graphs
+        if getattr(graph, "y", None) is not None
+    }
+    if len(labels) < 2:
+        raise ValueError(
+            f"训练至少需要 2 个APT组织类别；当前只有 {len(labels)} 个。"
+            "请使用包含多个APT组织样本的数据集。"
+        )
+
+
 def _graph_structure_summary(graphs: List[Data]) -> Dict[str, Any]:
     if not graphs:
         return {
@@ -2069,7 +2090,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     seed = int(config.get('seed', 42))
     gpu_id = int(config.get('gpu_id', -1))
     dataset_id = str(config.get('dataset_id', config.get('dataset_name', 'unknown')))
-    require_cuda = bool(config.get('require_cuda', True))
+    require_cuda = bool(config.get('require_cuda', False))
     auto_shrink_batch_size = bool(config.get('auto_shrink_batch_size', True))
     min_batch_size = max(1, int(config.get('min_batch_size', 1) or 1))
     max_nodes_per_batch = int(config.get('max_nodes_per_batch', 0) or 0)
@@ -2139,6 +2160,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     time_logger.update(**_graph_structure_summary(graphs))
     if not graphs:
         raise ValueError('No valid graphs loaded.')
+    validate_training_graphs(graphs)
 
     max_y = 0
     for g in graphs:

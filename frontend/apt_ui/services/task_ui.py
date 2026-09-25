@@ -62,6 +62,18 @@ def _sort_tasks(tasks: list[dict]) -> list[dict]:
     return sorted(tasks, key=lambda task: str(task.get("created", "")), reverse=True)
 
 
+def _display_progress(task: dict) -> int:
+    """Keep a newly-started preprocessing task visibly above an empty bar."""
+    try:
+        progress = int(task.get("progress", 0) or 0)
+    except (TypeError, ValueError):
+        progress = 0
+    progress = max(0, min(progress, 100))
+    if task.get("type") == "preprocess":
+        return max(5, progress)
+    return progress
+
+
 def _render_row(
     task: dict,
     *,
@@ -85,40 +97,41 @@ def _render_row(
         meta = f"{task.get('created', '-')} · `{task.get('id', '')[:8]}`"
         st.caption(f"{sub} · {meta}" if sub else meta)
         if is_active:
-            progress = int(task.get("progress", 0) or 0)
-            st.progress(max(0, min(progress, 100)) / 100)
+            progress = _display_progress(task)
+            st.progress(progress / 100)
             st.caption(task.get("message") or active_message)
         if task.get("error"):
             st.error(task["error"])
 
     with action_col:
-        btn_cols = st.columns(len(actions)) if len(actions) > 1 else [action_col]
-        for action, col in zip(actions, btn_cols):
-            with col:
-                label = f"{action.icon} {action.label}".strip()
-                action_key = f"{key_prefix}_{action.label}_{task.get('id')}"
+        # This panel is already rendered inside a page column. Creating another
+        # set of columns here would exceed Streamlit's supported nesting depth.
+        # Render multiple actions as compact stacked buttons instead.
+        for action in actions:
+            label = f"{action.icon} {action.label}".strip()
+            action_key = f"{key_prefix}_{action.label}_{task.get('id')}"
 
-                def execute(current_action=action, current_task=task) -> None:
-                    if current_action.handler(current_task):
-                        invalidate("tasks", "datasets", "models", "attribution_results")
-                        st.toast(f"{current_action.label}成功", icon="✅")
-                    else:
-                        st.warning(f"{current_action.label}失败")
+            def execute(current_action=action, current_task=task) -> None:
+                if current_action.handler(current_task):
+                    invalidate("tasks", "datasets", "models", "attribution_results")
+                    st.toast(f"{current_action.label}成功", icon="✅")
+                else:
+                    st.warning(f"{current_action.label}失败")
 
-                if action.label == ui.ACTION_LABELS["delete"] and action.enabled(task):
-                    ui.confirm_delete(
-                        action_key,
-                        f"任务“{title_fn(task)}”",
-                        execute,
-                    )
-                elif st.button(
-                    label,
-                    key=action_key,
-                    disabled=not action.enabled(task),
-                    width="stretch",
-                ):
-                    execute()
-                    st.rerun()
+            if action.label == ui.ACTION_LABELS["delete"] and action.enabled(task):
+                ui.confirm_delete(
+                    action_key,
+                    f"任务“{title_fn(task)}”",
+                    execute,
+                )
+            elif st.button(
+                label,
+                key=action_key,
+                disabled=not action.enabled(task),
+                width="stretch",
+            ):
+                execute()
+                st.rerun()
 
     st.divider()
 

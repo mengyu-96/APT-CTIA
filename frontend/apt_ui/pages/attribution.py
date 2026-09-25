@@ -21,7 +21,7 @@ VIEW_STATE_KEY = "attribution_page_view"
 TASK_VIEW_LABEL = "新建归因任务"
 HISTORY_VIEW_LABEL = "历史归因结果"
 MODEL_DISPLAY_NAMES = {
-    "RGAT": "GRACE",
+    "RGAT": "HERA",
     "GAT": "APT-ATT",
     "Hybrid": "APT-MMF",
     "GCN": "MLDSJ",

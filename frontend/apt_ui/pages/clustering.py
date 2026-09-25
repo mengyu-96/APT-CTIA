@@ -21,7 +21,7 @@ from apt_ui.services import ui
 POLL_STATE_KEY = "training_polling_active"
 RESULT_STATE_KEY = "current_model_result"
 MODEL_DISPLAY_NAMES = {
-    "RGAT": "GRACE",
+    "RGAT": "HERA",
     "GAT": "APT-ATT",
     "Hybrid": "APT-MMF",
     "GCN": "MLDSJ",
@@ -32,6 +32,21 @@ MODEL_DISPLAY_NAMES = {
 
 def _get_datasets() -> list[dict]:
     return get_json("/api/datasets", timeout=3, default=[])
+
+
+def _is_trainable_dataset(item: dict) -> bool:
+    try:
+        num_graphs = int(item.get("num_graphs", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+
+    stats = item.get("stats") or {}
+    apt_groups = {
+        str(group).strip()
+        for group in stats.get("apt_groups", [])
+        if str(group).strip() and str(group).strip().upper() != "UNKNOWN"
+    }
+    return num_graphs >= 3 and len(apt_groups) >= 2
 
 
 def _load_artifact_image(path: str) -> bytes | None:
@@ -164,6 +179,7 @@ def render_clustering() -> None:
 
     datasets = _get_datasets()
     graph_datasets = [item for item in datasets if "Graph" in item.get("type", "")]
+    trainable_datasets = [item for item in graph_datasets if _is_trainable_dataset(item)]
 
     left, right = st.columns([0.82, 1.18], gap="large")
 
@@ -174,13 +190,16 @@ def render_clustering() -> None:
                 if not graph_datasets:
                     st.warning("暂无可用图数据集，请先完成预处理。")
                     selected_dataset = None
+                elif not trainable_datasets:
+                    st.warning("暂无可训练数据集。训练至少需要 3 份报告，并包含至少 2 个APT组织。")
+                    selected_dataset = None
                 else:
-                    dataset_options = {item["name"]: item for item in graph_datasets}
+                    dataset_options = {item["name"]: item for item in trainable_datasets}
                     dataset_name = st.selectbox("选择数据集", list(dataset_options.keys()))
                     selected_dataset = dataset_options[dataset_name]
 
                 model_architectures = {
-                    "GRACE": "RGAT",
+                    "HERA": "RGAT",
                     "APT-ATT": "GAT",
                     "APT-MMF": "Hybrid",
                     "MLDSJ": "GCN",
@@ -253,6 +272,7 @@ def _submit_training(selected_dataset, algorithm, epochs, lr, batch_size,
         "auto_scale_accumulation": bool(auto_memory_guard),
         "dynamic_batch_by_graph_size": bool(auto_memory_guard),
         "mixed_precision": True,
+        "require_cuda": False,
         "seed": 42,
         "use_temporal": use_temporal,
         "temporal_hidden_dim": temporal_hidden,

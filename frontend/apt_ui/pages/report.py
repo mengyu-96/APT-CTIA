@@ -12,7 +12,7 @@ from apt_ui.services.tasks import get_task_detail, list_tasks
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5001")
 MODEL_DISPLAY_NAMES = {
-    "RGAT": "GRACE",
+    "RGAT": "HERA",
     "GAT": "APT-ATT",
     "Hybrid": "APT-MMF",
     "GCN": "MLDSJ",

@@ -19,6 +19,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tupl
 import os
 import sys
 import io
+import threading
 
 # 尝试导入可选依赖
 try:
@@ -91,6 +92,8 @@ LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FEATURE_SCHEMA_VERSION = "apt-ctia-feature-schema-v5"
 ENTITY_EXTRACTOR_VERSION = "rule-extractor-v5"
+_EMBEDDING_MODEL_CACHE: Dict[Tuple[str, str], object] = {}
+_EMBEDDING_MODEL_CACHE_LOCK = threading.Lock()
 
 
 def resolve_embedding_model_path(model_spec: str) -> str:
@@ -112,6 +115,65 @@ def resolve_embedding_model_path(model_spec: str) -> str:
             return str(local_dir.resolve())
 
     return model_spec
+
+
+def load_sentence_transformer(model_name_or_path: str, device: str):
+    """Load a cached embedding model before attempting any network request.
+
+    Hugging Face keeps one shared HTTP client per process. A long-running backend
+    can retain a client that another library has already closed, even when every
+    required model file is available in the local cache. Trying the cache-only
+    path first avoids that client entirely. If the model is not cached, reset the
+    shared client before the normal online download path.
+    """
+
+    if SentenceTransformer is None:
+        raise RuntimeError("sentence-transformers is unavailable")
+
+    cache_key = (str(model_name_or_path), str(device))
+    with _EMBEDDING_MODEL_CACHE_LOCK:
+        cached = _EMBEDDING_MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            model = SentenceTransformer(
+                model_name_or_path,
+                device=device,
+                local_files_only=True,
+            )
+        except Exception as local_error:
+            LOGGER.info(
+                "Embedding model was not usable from the local cache; retrying with hub access: %s",
+                local_error,
+            )
+            try:
+                from huggingface_hub.utils import close_session
+
+                close_session()
+            except Exception as reset_error:
+                LOGGER.debug("Unable to reset Hugging Face HTTP client: %s", reset_error)
+            model = SentenceTransformer(model_name_or_path, device=device)
+
+        _EMBEDDING_MODEL_CACHE[cache_key] = model
+        return model
+
+
+def clear_embedding_model_cache() -> None:
+    """Clear process-local embedding models, primarily for controlled restarts and tests."""
+    with _EMBEDDING_MODEL_CACHE_LOCK:
+        _EMBEDDING_MODEL_CACHE.clear()
+
+
+def warm_preprocessing_runtime(
+    model_spec: str = "all-MiniLM-L6-v2",
+    device: Optional[str] = None,
+):
+    """Load preprocessing dependencies and the embedding model before serving tasks."""
+    resolved_model = resolve_embedding_model_path(model_spec)
+    resolved_device = device or preferred_sentence_transformer_device()
+    LOGGER.info("Prewarming embedding model: %s on %s", resolved_model, resolved_device)
+    return load_sentence_transformer(resolved_model, resolved_device)
 
 # ============================================================================
 # 数据类定义
@@ -1490,7 +1552,7 @@ class GraphDatasetBuilder:
                 st_device = preferred_sentence_transformer_device()
                 resolved_model = resolve_embedding_model_path(self.config.embedding_model)
                 LOGGER.info(f"Loading embedding model: {resolved_model} on {st_device}")
-                self.embedder = SentenceTransformer(resolved_model, device=st_device)
+                self.embedder = load_sentence_transformer(resolved_model, st_device)
                 self.embedding_dim = int(self.embedder.get_sentence_embedding_dimension())
             except Exception as e:
                 raise RuntimeError(f"Failed to load required embedding model: {e}") from e

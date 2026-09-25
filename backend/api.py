@@ -67,6 +67,28 @@ def _run_preprocessing_pipeline(*args, **kwargs):
     return run_preprocessing_pipeline(*args, **kwargs)
 
 
+def prewarm_preprocessing_runtime() -> bool:
+    """Prepare heavy preprocessing dependencies before the API starts serving."""
+    if not ENABLE_PREPROCESSING:
+        logging.info("Preprocessing is disabled; skipping runtime prewarm.")
+        return False
+
+    started_at = time.perf_counter()
+    try:
+        from core.preprocess import warm_preprocessing_runtime
+
+        warm_preprocessing_runtime()
+    except Exception as exc:
+        logging.warning("Preprocessing runtime prewarm failed; tasks will retry on demand: %s", exc)
+        return False
+
+    logging.info(
+        "Preprocessing runtime prewarmed in %.2f seconds.",
+        time.perf_counter() - started_at,
+    )
+    return True
+
+
 def _run_inference_pipeline(*args, **kwargs):
     """Import PyTorch and graph dependencies only when inference starts."""
     from core.inference import run_inference_pipeline
@@ -2159,4 +2181,5 @@ def download_report(filename):
 if __name__ == '__main__':
     # 启动 Flask 服务，监听所有网络接口的 5001 端口
     # Disable debug mode to prevent auto-reloading on file changes
+    prewarm_preprocessing_runtime()
     app.run(host='0.0.0.0', port=5001, debug=False)

@@ -232,7 +232,6 @@ def _feature_card(icon: str, title: str, desc: str, tone: str) -> str:
         f'<div class="feature-module-icon"><i class="fas {icon}"></i></div>'
         f'<div class="feature-module-title">{title}</div>'
         f'<p>{desc}</p>'
-        f'<span class="feature-module-arrow" aria-hidden="true">→</span>'
         f"</div>"
     )
 
@@ -304,6 +303,13 @@ def _clear_session() -> None:
     st.rerun()
 
 
+def _clear_dataset_page_before_features() -> None:
+    """Remove the large dataset editor tree before feature charts are built."""
+    transition_slot = st.empty()
+    transition_slot.empty()
+    st.rerun()
+
+
 def main() -> None:
     st.set_page_config(
         page_title=SYSTEM_NAME,
@@ -321,8 +327,6 @@ def main() -> None:
     if css_file.exists():
         load_css(css_file)
     ui.apply_accessibility_metadata()
-    render_software_guide_entry()
-
     if not check_password():
         return
 
@@ -337,6 +341,7 @@ def main() -> None:
         st.session_state["_main_navigation_page"] = requested_page
 
     with st.sidebar:
+        render_software_guide_entry()
         st.markdown(
             """
             <div class="sidebar-brand">
@@ -390,16 +395,37 @@ def main() -> None:
         st.session_state["_main_navigation_page"] = selected_key
         st.query_params["page"] = selected_key
 
-    backend_available, backend_message = get_backend_status()
-    if not backend_available:
-        page_label = MENU_LABEL_BY_PAGE.get(selected_key, "当前页面")
-        st.error(f"{backend_message}，暂时无法加载“{page_label}”的数据。")
-        st.info(
-            "当前地址只启动了前端界面。请同时启动后端服务后再刷新页面；"
-            "Linux 部署环境请检查 backend 服务或容器是否正在运行。"
-        )
-        return
-    _render_page(selected_key)
+    def _emit_selected_page() -> None:
+        backend_available, backend_message = get_backend_status()
+        if not backend_available:
+            page_label = MENU_LABEL_BY_PAGE.get(selected_key, "当前页面")
+            st.error(f"{backend_message}，暂时无法加载“{page_label}”的数据。")
+            st.info(
+                "当前地址只启动了前端界面。请同时启动后端服务后再刷新页面；"
+                "Linux 部署环境请检查 backend 服务或容器是否正在运行。"
+            )
+            return
+        _render_page(selected_key)
+
+    previous_page = st.session_state.get("_rendered_page")
+    page_changed = previous_page is not None and previous_page != selected_key
+    st.session_state["_rendered_page"] = selected_key
+
+    if previous_page == "datasets" and selected_key == "features":
+        # The dataset manager can leave a large editor tree visible while the
+        # feature page builds its first charts. Finish one empty run first so
+        # Streamlit removes those stale nodes before rendering the new page.
+        _clear_dataset_page_before_features()
+
+    if page_changed:
+        # Clear stale content only when navigation selects another page. A
+        # selectbox rerun stays on the same page and must not blank the whole
+        # content area before Streamlit applies the widget update.
+        page_slot = st.empty()
+        with page_slot.container():
+            _emit_selected_page()
+    else:
+        _emit_selected_page()
 
 
 def _render_page(selected_key: str) -> None:
